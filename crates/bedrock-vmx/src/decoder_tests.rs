@@ -88,6 +88,16 @@ fn test_mov_byte() {
 }
 
 #[test]
+fn test_mov_byte_store() {
+    // mov [rbx], al = 88 03
+    let instr = decode_instruction(&[0x88, 0x03]).unwrap();
+    assert_eq!(instr.length, 2);
+    assert_eq!(instr.operation, MemoryOperation::Store);
+    assert_eq!(instr.register, 0); // AL
+    assert_eq!(instr.operand_size, 1);
+}
+
+#[test]
 fn test_movzx_byte() {
     // movzx eax, byte ptr [rbx] = 0F B6 03
     let instr = decode_instruction(&[0x0F, 0xB6, 0x03]).unwrap();
