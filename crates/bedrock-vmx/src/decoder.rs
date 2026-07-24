@@ -51,6 +51,7 @@ struct RexPrefix {
     #[allow(dead_code)]
     x: bool,
     /// REX.B - Extension of ModR/M r/m field or SIB base
+    #[allow(dead_code)]
     b: bool,
 }
 
@@ -147,29 +148,11 @@ pub fn decode_instruction(bytes: &[u8]) -> Result<DecodedInstruction, DecodeErro
         // MOV r32/r64, r/m32/r/m64 (8B /r)
         // Load from memory to register
         0x8B => {
-            if pos >= bytes.len() {
-                return Err(DecodeError::BufferTooShort);
-            }
-            let modrm = bytes[pos];
-            pos += 1;
-
-            let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
-            let mod_bits = modrm >> 6;
-            let rm = (modrm & 0x07) | (if rex.b { 0x08 } else { 0 });
-
-            // Calculate ModR/M length (displacement bytes)
-            let modrm_len = modrm_displacement_length(mod_bits, rm & 0x07, &bytes[pos..])?;
-            pos += modrm_len;
-
-            // mod=11 means register-to-register, not memory
-            if mod_bits == 0b11 {
-                return Err(DecodeError::UnsupportedAddressing);
-            }
-
+            let (register, length) = parse_modrm_mem(bytes, pos, &rex)?;
             Ok(DecodedInstruction {
-                length: pos as u8,
+                length,
                 operation: MemoryOperation::Load,
-                register: reg,
+                register,
                 operand_size,
             })
         }
@@ -177,81 +160,33 @@ pub fn decode_instruction(bytes: &[u8]) -> Result<DecodedInstruction, DecodeErro
         // MOV r/m32/r/m64, r32/r64 (89 /r)
         // Store from register to memory
         0x89 => {
-            if pos >= bytes.len() {
-                return Err(DecodeError::BufferTooShort);
-            }
-            let modrm = bytes[pos];
-            pos += 1;
-
-            let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
-            let mod_bits = modrm >> 6;
-            let rm = (modrm & 0x07) | (if rex.b { 0x08 } else { 0 });
-
-            let modrm_len = modrm_displacement_length(mod_bits, rm & 0x07, &bytes[pos..])?;
-            pos += modrm_len;
-
-            if mod_bits == 0b11 {
-                return Err(DecodeError::UnsupportedAddressing);
-            }
-
+            let (register, length) = parse_modrm_mem(bytes, pos, &rex)?;
             Ok(DecodedInstruction {
-                length: pos as u8,
+                length,
                 operation: MemoryOperation::Store,
-                register: reg,
+                register,
                 operand_size,
             })
         }
 
         // MOV r8, r/m8 (8A /r)
         0x8A => {
-            if pos >= bytes.len() {
-                return Err(DecodeError::BufferTooShort);
-            }
-            let modrm = bytes[pos];
-            pos += 1;
-
-            let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
-            let mod_bits = modrm >> 6;
-            let rm = (modrm & 0x07) | (if rex.b { 0x08 } else { 0 });
-
-            let modrm_len = modrm_displacement_length(mod_bits, rm & 0x07, &bytes[pos..])?;
-            pos += modrm_len;
-
-            if mod_bits == 0b11 {
-                return Err(DecodeError::UnsupportedAddressing);
-            }
-
+            let (register, length) = parse_modrm_mem(bytes, pos, &rex)?;
             Ok(DecodedInstruction {
-                length: pos as u8,
+                length,
                 operation: MemoryOperation::Load,
-                register: reg,
+                register,
                 operand_size: 1,
             })
         }
 
         // MOV r/m8, r8 (88 /r)
         0x88 => {
-            if pos >= bytes.len() {
-                return Err(DecodeError::BufferTooShort);
-            }
-            let modrm = bytes[pos];
-            pos += 1;
-
-            let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
-            let mod_bits = modrm >> 6;
-            let rm = (modrm & 0x07) | (if rex.b { 0x08 } else { 0 });
-
-            let modrm_len = modrm_displacement_length(mod_bits, rm & 0x07, &bytes[pos..])?;
-            pos += modrm_len;
-
-            if mod_bits == 0b11 {
-                return Err(DecodeError::UnsupportedAddressing);
-            }
-
+            let (register, length) = parse_modrm_mem(bytes, pos, &rex)?;
             Ok(DecodedInstruction {
-                length: pos as u8,
+                length,
                 operation: MemoryOperation::Store,
-                register: reg,
+                register,
                 operand_size: 1,
             })
         }
@@ -267,30 +202,15 @@ pub fn decode_instruction(bytes: &[u8]) -> Result<DecodedInstruction, DecodeErro
 
             match opcode2 {
                 0xB6 | 0xB7 => {
-                    if pos >= bytes.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let modrm = bytes[pos];
-                    pos += 1;
-
-                    let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
-                    let mod_bits = modrm >> 6;
-                    let rm = (modrm & 0x07) | (if rex.b { 0x08 } else { 0 });
-
-                    let modrm_len = modrm_displacement_length(mod_bits, rm & 0x07, &bytes[pos..])?;
-                    pos += modrm_len;
-
-                    if mod_bits == 0b11 {
-                        return Err(DecodeError::UnsupportedAddressing);
-                    }
+                    let (register, length) = parse_modrm_mem(bytes, pos, &rex)?;
 
                     // Source operand size (memory)
                     let mem_operand_size = if opcode2 == 0xB6 { 1 } else { 2 };
 
                     Ok(DecodedInstruction {
-                        length: pos as u8,
+                        length,
                         operation: MemoryOperation::Load,
-                        register: reg,
+                        register,
                         // For MOVZX, we return the source (memory) operand size
                         // The emulation needs to know to zero-extend
                         operand_size: mem_operand_size,
@@ -302,6 +222,34 @@ pub fn decode_instruction(bytes: &[u8]) -> Result<DecodedInstruction, DecodeErro
 
         _ => Err(DecodeError::UnsupportedOpcode),
     }
+}
+
+/// Parse a memory-operand ModR/M byte (plus any SIB/displacement) at `pos`.
+///
+/// Returns the register operand (with REX.R applied) and the total instruction
+/// length up to and including the ModR/M encoding. Register-direct forms
+/// (mod=11) are rejected with `UnsupportedAddressing` since they are not memory
+/// operands.
+fn parse_modrm_mem(bytes: &[u8], pos: usize, rex: &RexPrefix) -> Result<(u8, u8), DecodeError> {
+    if pos >= bytes.len() {
+        return Err(DecodeError::BufferTooShort);
+    }
+    let modrm = bytes[pos];
+    let mut pos = pos + 1;
+
+    let reg = ((modrm >> 3) & 0x07) | (if rex.r { 0x08 } else { 0 });
+    let mod_bits = modrm >> 6;
+    let rm = modrm & 0x07;
+
+    let modrm_len = modrm_displacement_length(mod_bits, rm, &bytes[pos..])?;
+    pos += modrm_len;
+
+    // mod=11 means register-to-register, not memory
+    if mod_bits == 0b11 {
+        return Err(DecodeError::UnsupportedAddressing);
+    }
+
+    Ok((reg, pos as u8))
 }
 
 /// Calculate the displacement length for a ModR/M byte.
