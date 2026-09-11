@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bedrock_vm::events::EventKind;
 use bedrock_vm::file_store::FileWriter;
+use bedrock_vm::fuzz_input::{FuzzOutcome, InputServer};
 use bedrock_vm::{
     EventCategories, EventConfig as VmEventConfig, EventStream, ExitKind, ExitTrigger, Vm, VmError,
 };
@@ -205,6 +206,10 @@ pub struct Branch {
     event_config: EventConfig,
     /// Used to extract files from the guest to the host.
     file_writer: FileWriter,
+    /// Serves fuzzer testcases into the guest's registered `fuzzamoto-input`
+    /// buffer. Holds only a cached slot index, so it is per-branch: a fork has
+    /// its own copy-on-write pages and must be mapped separately.
+    input_server: InputServer,
 }
 
 impl Branch {
@@ -243,7 +248,11 @@ impl Branch {
             input_recording,
             last_stop_at: None,
             event_config: EventConfig::default(),
-            file_writer: FileWriter::new(),
+            file_writer: match lab.file_store_dir.clone() {
+                Some(dir) => FileWriter::new().with_base_dir(dir),
+                None => FileWriter::new(),
+            },
+            input_server: InputServer::new(),
         };
         lab.sink.on_event(Event::BranchCreated {
             branch: id,
@@ -565,6 +574,76 @@ impl Branch {
             .collect())
     }
 
+    /// Write one fuzzer testcase into the guest's registered `fuzzamoto-input`
+    /// buffer.
+    ///
+    /// Call this when [`run_until`](Self::run_until) yields
+    /// [`ExitKind::FuzzNextInput`], then run the branch again — the guest
+    /// resumes inside its `HYPERCALL_FUZZ_NEXT_INPUT` and reads the input back
+    /// out of the buffer.
+    ///
+    /// In a fork-per-testcase loop this is the only per-execution host→guest
+    /// write: fork the checkpoint taken at the guest's first `FuzzNextInput`
+    /// exit, serve a different input into each fork, and run.
+    ///
+    /// # Errors
+    ///
+    /// - The guest registered no `fuzzamoto-input` buffer
+    /// - `input` is larger than [`fuzz_input_capacity`](Self::fuzz_input_capacity)
+    /// - The mmap or info-query ioctl fails
+    pub fn serve_fuzz_input(&mut self, input: &[u8]) -> Result<()> {
+        let vm = self.vm.as_mut().expect("Branch.vm taken");
+        self.input_server.serve(vm, input).map_err(LabError::from)
+    }
+
+    /// Tell the guest there are no more testcases, so it should shut down.
+    ///
+    /// # Errors
+    ///
+    /// As [`serve_fuzz_input`](Self::serve_fuzz_input), minus the size check.
+    pub fn serve_fuzz_input_eof(&mut self) -> Result<()> {
+        let vm = self.vm.as_mut().expect("Branch.vm taken");
+        self.input_server.serve_eof(vm).map_err(LabError::from)
+    }
+
+    /// Read back what the guest reported about the testcase it just finished.
+    ///
+    /// Valid after a [`run_until`](Self::run_until) that yielded
+    /// [`ExitKind::FuzzNextInput`]. The first such exit reports on the guest's
+    /// setup rather than on a testcase, so a fuzzer checkpoints there instead
+    /// of scoring it.
+    ///
+    /// # Errors
+    ///
+    /// As [`serve_fuzz_input`](Self::serve_fuzz_input).
+    pub fn fuzz_outcome(&mut self) -> Result<FuzzOutcome> {
+        let vm = self.vm.as_mut().expect("Branch.vm taken");
+        self.input_server.outcome(vm).map_err(LabError::from)
+    }
+
+    /// The raw `aux` header word the guest wrote into its input buffer.
+    ///
+    /// The harness ABI uses this for a failure-message length; a bespoke guest
+    /// may use it for anything the host agrees on.
+    ///
+    /// # Errors
+    ///
+    /// As [`serve_fuzz_input`](Self::serve_fuzz_input).
+    pub fn fuzz_aux(&mut self) -> Result<u64> {
+        let vm = self.vm.as_mut().expect("Branch.vm taken");
+        self.input_server.aux(vm).map_err(LabError::from)
+    }
+
+    /// The largest testcase the guest's input buffer can hold, in bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`serve_fuzz_input`](Self::serve_fuzz_input).
+    pub fn fuzz_input_capacity(&mut self) -> Result<usize> {
+        let vm = self.vm.as_mut().expect("Branch.vm taken");
+        self.input_server.capacity(vm).map_err(LabError::from)
+    }
+
     /// Return every distinct identifier currently registered on this
     /// branch's VM, in slot-ascending order (first time each id is seen).
     ///
@@ -655,6 +734,18 @@ impl Branch {
                         return Ok((at, RunOutcome::Yielded { kind: exit.kind() }))
                     }
                 },
+                // A guest dumping a file mid-run should not stop the branch —
+                // the IR scenario hands its program context to the host this
+                // way. `run_io_action` already did this; `run_until` did not,
+                // so the same hypercall behaved differently depending on which
+                // loop was pumping the VM.
+                ExitKind::FileStore => {
+                    let vm = self.vm.as_mut().expect("Branch.vm taken");
+                    self.file_writer
+                        .write(vm)
+                        .map_err(|source| LabError::FileStoreFailed { at, source })?;
+                    continue;
+                }
                 ExitKind::Continue | ExitKind::EventBufferFull => continue,
                 kind => return Ok((at, RunOutcome::Yielded { kind })),
             }

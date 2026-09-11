@@ -9,6 +9,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crate::Vm;
 
@@ -27,9 +28,19 @@ pub const FILE_STORE_HEADER_LEN: usize = 16;
 pub const FILE_STORE_IO_ERROR: i64 = -1;
 
 /// Reads chunks of guest files and appends them to host files.
+///
+/// The guest chooses the file name. By default it is used as given, relative to
+/// the process's current directory — so a guest may name an absolute host path,
+/// which is how `bedrock-file-store` is normally driven (`bedrock-file-store
+/// <guest-path> <host-path>`). [`with_base_dir`](FileWriter::with_base_dir)
+/// redirects *relative* names into a chosen directory; an absolute name still
+/// wins, as `Path::join` semantics imply.
 pub struct FileWriter {
     handles: HashMap<String, File>,
     slot: Option<usize>,
+    /// Directory guest files are written into. `None` means the process's
+    /// current directory, preserving the original behaviour.
+    base_dir: Option<PathBuf>,
 }
 
 impl Default for FileWriter {
@@ -43,7 +54,17 @@ impl FileWriter {
         Self {
             handles: HashMap::new(),
             slot: None,
+            base_dir: None,
         }
+    }
+
+    /// Write guest files into `dir` instead of the process's current directory.
+    ///
+    /// The directory is created if missing on first write.
+    #[must_use]
+    pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.base_dir = Some(dir.into());
+        self
     }
 
     /// Write the chunk the guest sent to a file on the host.
@@ -86,15 +107,24 @@ impl FileWriter {
             String::from_utf8_lossy(&buf[FILE_STORE_HEADER_LEN..FILE_STORE_HEADER_LEN + name_len])
                 .into_owned();
 
+        let base_dir = self.base_dir.clone();
+
         // Open and truncate the file if not already cached from a prior chunked write.
         let file = match self.handles.entry(name) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
+                let path = match &base_dir {
+                    Some(dir) => {
+                        std::fs::create_dir_all(dir)?;
+                        dir.join(e.key())
+                    }
+                    None => PathBuf::from(e.key()),
+                };
                 let handle = OpenOptions::new()
                     .create(true)
                     .write(true)
                     .truncate(true)
-                    .open(e.key())?;
+                    .open(path)?;
                 e.insert(handle)
             }
         };
@@ -134,3 +164,4 @@ fn write_result(buf: &mut [u8], result: i64) {
     buf[0..8].copy_from_slice(&result.to_le_bytes());
     buf[8..16].fill(0);
 }
+

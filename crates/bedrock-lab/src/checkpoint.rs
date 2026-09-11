@@ -48,6 +48,13 @@ pub struct LabOpts {
     /// hypercall, so they are served during this constructor's boot loop and
     /// need not persist into the tree.
     pub files: Vec<(String, String)>,
+    /// Directory that guest files sent over `HYPERCALL_FILE_STORE` are written
+    /// into. `None` uses the process's current directory.
+    ///
+    /// The guest picks the file *name* (restricted to a single path component),
+    /// so this is what decides *where* those files land — set it when the guest
+    /// is untrusted, which in a fuzzing run it is.
+    pub file_store_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for LabOpts {
@@ -57,6 +64,7 @@ impl Default for LabOpts {
             sink: Arc::new(Discard),
             rng: RngMode::Inherit,
             files: Vec::new(),
+            file_store_dir: None,
         }
     }
 }
@@ -214,6 +222,7 @@ impl Checkpoint {
             sink,
             rng,
             files,
+            file_store_dir,
         } = opts;
 
         let (rdrand_config, input_source) = match rng {
@@ -230,6 +239,7 @@ impl Checkpoint {
                 sink,
                 rng: RngMode::Inherit,
                 files,
+                file_store_dir,
             },
             input_source,
         ))
@@ -247,9 +257,10 @@ impl Checkpoint {
             sink,
             rng: _,
             files: _,
+            file_store_dir,
         } = opts;
 
-        let lab = LabInner::new(tsc_frequency, sink);
+        let lab = LabInner::new(tsc_frequency, sink, file_store_dir);
         let id = CheckpointId(lab.next_checkpoint_id());
         let inner = Arc::new(CheckpointInner {
             id,
