@@ -15,6 +15,7 @@ use log::{debug, info, trace, warn};
 use bedrock_vm::events::EventKind;
 use bedrock_vm::file_store::FileWriter;
 use bedrock_vm::file_xfer::FileServer;
+use bedrock_vm::fuzz_input::InputServer;
 use bedrock_vm::io_channel;
 use bedrock_vm::{
     load_kernel, ConsoleLine, EventCategories, EventConfig, EventStream, ExitKind, ExitStatsReport,
@@ -459,6 +460,9 @@ fn run() -> io::Result<()> {
     // to copy files from the guest.
     let mut file_writer = FileWriter::new();
 
+    // Answers HYPERCALL_FUZZ_NEXT_INPUT with EOF — see the exit arm below.
+    let mut input_server = InputServer::new();
+
     // Run VM
     info!("Starting VM...");
     let wall_clock_start = std::time::Instant::now();
@@ -572,6 +576,18 @@ fn run() -> io::Result<()> {
                         match file_writer.write(&mut vm) {
                             Ok(n) => trace!("Wrote file chunk ({} bytes)", n),
                             Err(e) => warn!("Failed to write guest file chunk on host: {}", e),
+                        }
+                        continue;
+                    }
+                    ExitKind::FuzzNextInput => {
+                        // The CLI is not a fuzzer and has no testcases to
+                        // serve. Answer EOF so a harness guest shuts down
+                        // cleanly instead of spinning on an unanswered
+                        // hypercall; driving this loop is what
+                        // `bedrock-lab`'s fork-per-testcase API is for.
+                        match input_server.serve_eof(&mut vm) {
+                            Ok(()) => debug!("Answered fuzz-input request with EOF"),
+                            Err(e) => warn!("Failed to answer fuzz-input request: {}", e),
                         }
                         continue;
                     }

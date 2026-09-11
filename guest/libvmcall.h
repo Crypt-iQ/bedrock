@@ -92,6 +92,14 @@ typedef unsigned long long vmcall_u64;
  */
 #define HYPERCALL_FILE_STORE 12ULL
 
+/*
+ * Fetch the next fuzzer testcase into the registered fuzz-input buffer. No
+ * register arguments — the response is framed inside the buffer the guest
+ * registered under VMCALL_FUZZ_INPUT_BUFFER_ID (see VMCALL_FUZZ_INPUT_* below).
+ * Returns 0 in RAX; the real result is the response header the host writes.
+ */
+#define HYPERCALL_FUZZ_NEXT_INPUT 13ULL
+
 /* ------------------------------------------------------------------------- */
 /* ABI constants.                                                            */
 /* ------------------------------------------------------------------------- */
@@ -177,6 +185,41 @@ typedef unsigned long long vmcall_u64;
 #define VMCALL_FILE_STORE_BUFFER_ID "bedrock-file-store"
 #define VMCALL_FILE_STORE_HEADER_LEN 16U
 #define VMCALL_FILE_STORE_IO_ERROR (-1LL)
+
+/*
+ * Fuzz-input framing (HYPERCALL_FUZZ_NEXT_INPUT). The guest registers one
+ * feedback buffer under the id VMCALL_FUZZ_INPUT_BUFFER_ID and uses it as the
+ * host->guest transport for testcases. Mirrors
+ * crates/bedrock-vm/src/fuzz_input.rs — keep in sync.
+ *
+ * The header carries both directions, because both happen at the same
+ * hypercall: the guest reports on the testcase it just finished in the same
+ * call that asks for the next one.
+ *
+ *   [0..8)   i64 result   (host writes): >=0 = input byte count,
+ *                         VMCALL_FUZZ_INPUT_EOF = no more inputs, shut down
+ *   [8..16)  u64 status   (guest writes): outcome of the PREVIOUS testcase,
+ *                         one of VMCALL_FUZZ_STATUS_*
+ *   [16..24) u64 aux      (guest writes): message length when status is FAIL
+ *   [24..32) reserved (zero)
+ *   [32..32+result) the input bytes (host writes), or the guest's failure
+ *                   message when status is FAIL
+ *
+ * The host zeroes the guest-written words every time it serves an input, so a
+ * forked VM never inherits its parent's status.
+ *
+ * The buffer is sized by the guest at registration, up to
+ * VMCALL_FEEDBACK_BUFFER_MAX_SIZE; usable input capacity is that size less
+ * VMCALL_FUZZ_INPUT_HEADER_LEN.
+ */
+#define VMCALL_FUZZ_INPUT_BUFFER_ID "fuzzamoto-input"
+#define VMCALL_FUZZ_INPUT_HEADER_LEN 32U
+#define VMCALL_FUZZ_INPUT_EOF (-1LL)
+
+/* Values for the guest-written status word at [8..16). */
+#define VMCALL_FUZZ_STATUS_OK 0ULL
+#define VMCALL_FUZZ_STATUS_SKIP 1ULL
+#define VMCALL_FUZZ_STATUS_FAIL 2ULL
 
 /* ------------------------------------------------------------------------- */
 /* Generic VMCALL primitives — hypercall number plus up to five arguments.   */
@@ -347,6 +390,19 @@ static inline vmcall_u64 vmcall_file_fetch(void)
 static inline vmcall_u64 vmcall_file_store(void)
 {
         return vmcall0(HYPERCALL_FILE_STORE);
+}
+
+/*
+ * Block until the host supplies the next fuzzer testcase in the registered
+ * fuzz-input buffer. Always returns 0 — read the result word out of the buffer
+ * header to get the input length (or VMCALL_FUZZ_INPUT_EOF).
+ *
+ * The host checkpoints the VM at this exit, so on a forked VM this call is
+ * where execution resumes, with a testcase already written into the buffer.
+ */
+static inline vmcall_u64 vmcall_fuzz_next_input(void)
+{
+	return vmcall0(HYPERCALL_FUZZ_NEXT_INPUT);
 }
 
 #ifdef __cplusplus

@@ -394,6 +394,25 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
             }
             ExitHandlerResult::ExitToUserspace(ExitReason::VmcallFileStore)
         }
+        HYPERCALL_FUZZ_NEXT_INPUT => {
+            // The guest harness wants the next fuzzer testcase. Exactly like
+            // HYPERCALL_FILE_FETCH, the hypervisor owns none of the framing:
+            // the host driver writes the input into the (host-mapped)
+            // `fuzzamoto-input` feedback buffer before the next RUN. We only
+            // set RAX to 0, advance RIP and exit to userspace. The meaningful
+            // result (input length, or -1 for "no more inputs") is delivered in
+            // the buffer's response header, not in a register.
+            //
+            // Advancing RIP here is what makes fork-per-testcase work: the
+            // checkpoint taken at this exit resumes each branch *after* the
+            // VMCALL, so a fork never re-executes the hypercall it was forked
+            // at and never asks the host for a second input.
+            ctx.state_mut().gprs.rax = 0;
+            if let Err(e) = advance_rip(ctx) {
+                return ExitHandlerResult::Error(e);
+            }
+            ExitHandlerResult::ExitToUserspace(ExitReason::VmcallFuzzNextInput)
+        }
         HYPERCALL_IO_REGISTER_PAGE => {
             // RBX = guest virtual address of the shared 4KB page.
             // Must be 4KB-aligned; the GPA is what we record because the

@@ -226,6 +226,13 @@ pub enum ExitReason {
     /// VMCALL hypercall: guest sent the next chunk of a guest file via
     /// `HYPERCALL_FILE_STORE` (RAX=12).
     VmcallFileStore = 270,
+    /// VMCALL hypercall: guest requested the next fuzzer input via
+    /// `HYPERCALL_FUZZ_NEXT_INPUT` (RAX=13). The host writes the next testcase
+    /// into the registered `fuzzamoto-input` feedback buffer (result/length
+    /// framed in the buffer) and resumes the VM. This is the exit a snapshot
+    /// fuzzer checkpoints at, so every forked branch resumes from inside the
+    /// hypercall with its own input.
+    VmcallFuzzNextInput = 271,
 }
 
 /// Error when converting from raw exit reason value.

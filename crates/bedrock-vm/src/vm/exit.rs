@@ -76,6 +76,13 @@ pub enum ExitKind {
     },
     /// Guest sent the next chunk of a guest file (`HYPERCALL_FILE_STORE`).
     FileStore,
+    /// Guest harness requested the next fuzzer input (`HYPERCALL_FUZZ_NEXT_INPUT`).
+    ///
+    /// The host should write the next testcase into the guest's registered
+    /// `fuzzamoto-input` feedback buffer — see [`crate::fuzz_input::InputServer`]
+    /// — and call `run()` again. A snapshot fuzzer takes its `Checkpoint` at
+    /// this exit and forks one branch per testcase.
+    FuzzNextInput,
 }
 
 /// VM exit information returned from the RUN ioctl.
@@ -141,6 +148,7 @@ impl VmExit {
             268 => "VMCALL_FILE_FETCH",
             269 => "VMCALL_GET_RANDOM",
             270 => "VMCALL_FILE_STORE",
+            271 => "VMCALL_FUZZ_NEXT_INPUT",
             _ => "UNKNOWN",
         }
     }
@@ -162,6 +170,7 @@ impl VmExit {
             268 => ExitKind::FileFetch,
             269 => ExitKind::VmcallGetRandom,
             270 => ExitKind::FileStore,
+            271 => ExitKind::FuzzNextInput,
             // Continuable: preemption timer, need_resched, mwait, monitor,
             // I/O instruction, pool exhausted, PEBS scratch-page registration,
             // I/O channel page registration (no userspace action needed —
