@@ -149,6 +149,10 @@ pub fn handle_msr_read<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
         | msr::IA32_ENERGY_PERF_BIAS
         | msr::MSR_OC_MAILBOX => 0,
         msr::MSR_SMI_COUNT => 0,
+        msr::IA32_DEBUGCTL => {
+            // No branch tracing or block stepping.
+            0
+        }
         msr::MSR_AMD64_DE_CFG => {
             // AMD MSR probed by Linux on Intel.
             0
@@ -322,6 +326,9 @@ pub fn handle_msr_write<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
         | msr::IA32_ENERGY_PERF_BIAS
         | msr::MSR_OC_MAILBOX => {
             // Ignored.
+        }
+        msr::IA32_DEBUGCTL => {
+            // Ignored; BTF unsupported.
         }
         // SYSCALL MSRs (STAR, LSTAR, CSTAR, FMASK) are passthrough.
         _ => {
