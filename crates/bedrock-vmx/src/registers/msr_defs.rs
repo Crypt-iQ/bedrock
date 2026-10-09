@@ -227,6 +227,10 @@ pub mod msr {
     pub const MSR_PPERF: u32 = 0x64E;
     /// Overclocking mailbox (Turbo Max 3.0).
     pub const MSR_OC_MAILBOX: u32 = 0x150;
+    /// Time-stamp counter (same value as RDTSC).
+    pub const IA32_TIME_STAMP_COUNTER: u32 = 0x10;
+    /// Debug control (BTF, LBR).
+    pub const IA32_DEBUGCTL: u32 = 0x1D9;
     /// SMI count.
     pub const MSR_SMI_COUNT: u32 = 0x34;
     /// Miscellaneous power management.
