@@ -33,6 +33,10 @@ pub fn handle_msr_read<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
             // Write-only.
             0
         }
+        msr::IA32_TIME_STAMP_COUNTER => {
+            // Same value as RDTSC.
+            ctx.state().emulated_tsc
+        }
         msr::IA32_TSC_ADJUST => {
             // TSC adjustment unsupported.
             0
@@ -197,6 +201,9 @@ pub fn handle_msr_write<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
         }
         msr::IA32_PRED_CMD => {
             // IBPB: no-op.
+        }
+        msr::IA32_TIME_STAMP_COUNTER => {
+            // Ignored; the guest cannot set the TSC.
         }
         msr::IA32_TSC_ADJUST => {
             // Ignored.

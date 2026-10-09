@@ -254,6 +254,26 @@ fn test_msr_read_exits_to_userspace() {
 }
 
 #[test]
+fn test_msr_read_tsc_matches_rdtsc() {
+    let mut ctx = MockVmContext::new();
+
+    ctx.set_exit_reason(ExitReason::MsrRead);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(2); // RDMSR is 2 bytes
+                                // emulated_tsc = last_instruction_count + tsc_offset
+    ctx.state_mut().last_instruction_count = 0x1234_5678_9ABC_DEF0;
+    ctx.gprs_mut().rcx = 0x10; // IA32_TIME_STAMP_COUNTER
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs_mut().rax, 0x9ABC_DEF0);
+    assert_eq!(ctx.gprs_mut().rdx, 0x1234_5678);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1002));
+}
+
+#[test]
 fn test_msr_write_exits_to_userspace() {
     let mut ctx = MockVmContext::new();
 
