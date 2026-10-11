@@ -341,6 +341,11 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 	if (vtime_before(vtime, vtime_now - SLICE_NS))
 		vtime = vtime_now - SLICE_NS;
 	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, SLICE_NS, vtime, enq_flags);
+
+	/* SCX_ENQ_LAST: dispatch() already found nothing, so without a kick the CPU
+	 * idles with this task sitting on the shared DSQ. */
+	if (enq_flags & SCX_ENQ_LAST)
+		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
