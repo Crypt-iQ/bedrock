@@ -368,6 +368,11 @@ void BPF_STRUCT_OPS(chaos_running, struct task_struct *p)
 {
 	if (vtime_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
+
+	/* The kernel may refill with SCX_SLICE_DFL (20 ms) instead of SLICE_NS, which
+	 * would make the u64 charge in chaos_stopping() wrap; clamp it back. */
+	if (p->scx.slice > SLICE_NS)
+		p->scx.slice = SLICE_NS;
 }
 
 /* Charge the time the task ran, scaled by the inverse of its weight, so
