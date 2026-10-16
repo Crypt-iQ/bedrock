@@ -65,10 +65,10 @@ int main(void) {
     // crates/bedrock-vmx/src/exits/pebs.rs. Decode them for diagnostics.
     fprintf(stderr, "PEBS registration failed (rax=0x%lx): ", result);
     if (result == VMCALL_PEBS_ERR_UNSUPPORTED) {
-        fprintf(stderr, "host CPU does not support EPT-friendly PEBS "
-                        "(IA32_PERF_CAPABILITIES.PEBS_BASELINE clear, "
-                        "or running under a hypervisor that doesn't expose "
-                        "PEBS to nested guests — common with KVM L1)\n");
+        fprintf(stderr, "host CPU supports neither EPT-friendly PEBS nor "
+                        "the PMI fallback (needs arch PMU v2+ with a fixed "
+                        "counter and host x2APIC; often missing under a "
+                        "hypervisor such as KVM L1)\n");
     } else if (result == VMCALL_PEBS_ERR_UNALIGNED) {
         fprintf(stderr, "page address not 4KB-aligned\n");
     } else if (result == VMCALL_PEBS_ERR_WALK_FAILED) {

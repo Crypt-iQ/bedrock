@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Precise VM exits via EPT-friendly PEBS.
+//! Precise VM exits via EPT-friendly PEBS, or a PMI fallback.
 //!
 //! PEBS on `IA32_FIXED_CTR0` overflows shortly before the target instruction;
 //! the PEBS Buffer page is R+E in EPT, so the record write traps as an EPT
 //! violation with the asynchronous bit set. The MTF margin path in
 //! `exits/mod.rs` single-steps the last few instructions.
+//!
+//! Without EPT-friendly PEBS, `PreciseExitMode::Pmi` instead sets the PMI bit
+//! of `IA32_FIXED_CTR0`: the overflow raises a PMI, which Linux routes through
+//! LVTPC as an NMI, so it arrives as an NMI-exiting VM exit. PMI skid is far
+//! larger than PDist's, so the margin (and thus MTF stepping) is wider.
 //!
 //! See SDM Vol 3B 21.9 (PEBS), 21.9.4 (Reduced Skid), 21.9.5 (EPT-Friendly);
 //! Vol 3C Table 29-7 (exit qualification bit 16).
@@ -64,6 +69,15 @@ pub enum PebsAction {
     InjectInterrupt(u8),
 }
 
+/// How precise-exit counter overflows reach the hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreciseExitMode {
+    /// EPT-friendly PEBS + PDist: the record write traps as an EPT violation.
+    Pebs,
+    /// Counter-overflow PMI, delivered as a host NMI (NMI exiting).
+    Pmi,
+}
+
 /// Host PMU MSRs saved by `pebs_pre_vm_entry`, restored by `pebs_post_vm_exit`.
 #[derive(Default, Clone, Copy)]
 pub struct PebsHostMsrs {
@@ -77,6 +91,8 @@ pub struct PebsHostMsrs {
 /// Per-VM PEBS state for precise exits. `Some` in `VmState` once
 /// `HYPERCALL_REGISTER_PEBS_PAGE` has installed a scratch page.
 pub struct PebsState {
+    /// Overflow delivery mechanism, fixed at registration.
+    pub mode: PreciseExitMode,
     /// GPA of the page holding the DS Management Area.
     pub ds_management_gpa: u64,
     /// GPA of the PEBS Buffer; same page as `ds_management_gpa`, R+E in EPT.
@@ -109,6 +125,9 @@ pub struct PebsState {
     pub host_msrs: PebsHostMsrs,
     /// Gates the one-time "first arm" log line per VM.
     pub logged_first_arm: bool,
+    /// PMI mode: the last NMI exit was our `IA32_FIXED_CTR0` overflow (set by
+    /// `pebs_post_vm_exit`, consumed by `handle_exception_nmi`).
+    pub pmi_fired: bool,
 }
 
 impl PebsState {
@@ -120,6 +139,7 @@ impl PebsState {
     /// preserved); safe because parent and child never run concurrently.
     pub fn clone_for_fork(&self) -> Self {
         Self {
+            mode: self.mode,
             ds_management_gpa: self.ds_management_gpa,
             pebs_buffer_gpa: self.pebs_buffer_gpa,
             ds_area_va: self.ds_area_va,
@@ -134,6 +154,7 @@ impl PebsState {
             counter_reload: 0,
             host_msrs: PebsHostMsrs::default(),
             logged_first_arm: false,
+            pmi_fired: false,
         }
     }
 }
@@ -143,6 +164,26 @@ impl PebsState {
 /// FIXED_CTR0 is used for PEBS because SPR lists its PDist as
 /// instruction-granularity (SDM Vol 3B Table 21-51, Figure 21-2).
 const FIXED_CTR_CTRL_FC0_OS_USR: u64 = 0b11;
+
+/// `FIXED_CTR_CTRL_FC0_OS_USR` plus the FC0 PMI-on-overflow bit (bit 3).
+const FIXED_CTR_CTRL_FC0_OS_USR_PMI: u64 = 0b1011;
+
+/// `IA32_PERF_GLOBAL_STATUS` overflow bit for `IA32_FIXED_CTR0`.
+const GLOBAL_STATUS_FIXED_CTR0_OVF: u64 = 1 << 32;
+
+/// Retired instructions by which the PMI exit is aimed before the target.
+/// PMI delivery (LAPIC NMI) skids far more than PDist: up to 239 seen on Ice
+/// Lake-SP. `max_pebs_skid` reports the observed worst case for tuning.
+const PMI_MARGIN: u64 = 320;
+
+/// Smallest target distance worth arming for: `PEBS_MIN_DELTA` for PDist; a
+/// PMI has no such floor, so its MTF window is only the margin wide.
+pub fn min_arm_delta(mode: PreciseExitMode) -> u64 {
+    match mode {
+        PreciseExitMode::Pebs => PEBS_MIN_DELTA,
+        PreciseExitMode::Pmi => PEBS_MIN_DELTA, // TODO: Changeme
+    }
+}
 
 /// Bit 32 of `IA32_PERF_GLOBAL_CTRL` enables `IA32_FIXED_CTR0`.
 pub const PERF_GLOBAL_CTRL_FIXED_CTR0: u64 = 1 << 32;
@@ -157,11 +198,14 @@ const PMC_COUNTER_MASK: u64 = (1u64 << PMC_COUNTER_WIDTH_BITS) - 1;
 /// path (`update_mtf_state`).
 pub const PEBS_MIN_DELTA: u64 = 257;
 
-/// Retired instructions by which the PEBS exit fires *before* the target;
+/// Retired instructions by which the precise exit fires *before* the target;
 /// `update_mtf_state` single-steps the rest. Absorbs the occasional skid of
-/// the asynchronous record write. Model-specific, so resolved from host
-/// CPUID once and cached.
-pub fn get_pebs_margin() -> u64 {
+/// the asynchronous record write (PEBS, model-specific, resolved from host
+/// CPUID once and cached) or of PMI delivery.
+pub fn get_pebs_margin(mode: PreciseExitMode) -> u64 {
+    if mode == PreciseExitMode::Pmi {
+        return PMI_MARGIN;
+    }
     // `u64::MAX` = not yet resolved.
     let cached = PEBS_MARGIN_CACHE.load(Ordering::Relaxed);
     if cached != u64::MAX {
@@ -181,9 +225,9 @@ fn margin_for_host_cpu() -> u64 {
     // Tuned on the Bitcoin workload (0 late timer injects). Model numbers
     // from Linux `intel-family.h`.
     match (family, model) {
-        (0x6, 0x8F) => 3, // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
-        (0x6, 0x6A) => 8, // Ice Lake-SP (ex: Xeon Silver 4310)
-        _ => 8,           // default for untested models
+        (0x6, 0x8F) => 3,  // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
+        (0x6, 0x6A) => 12, // Ice Lake-SP (ex: Xeon Silver 4310); skid up to 9 seen
+        _ => 8,            // default for untested models
     }
 }
 
@@ -219,7 +263,7 @@ pub enum ArmResult {
     Armed,
     /// `target_tsc < current_tsc`.
     AlreadyPast,
-    /// Delta below `PEBS_MIN_DELTA + margin`; left to `update_mtf_state`.
+    /// Delta below `min_arm_delta + margin`; left to `update_mtf_state`.
     BelowMinDelta,
     /// No `PebsState` is installed (no scratch page registered).
     NotRegistered,
@@ -239,9 +283,9 @@ pub fn arm_precise_exit(
     if target_tsc < current_tsc {
         return ArmResult::AlreadyPast;
     }
-    let pebs_margin = get_pebs_margin();
+    let pebs_margin = get_pebs_margin(pebs.mode);
     let delta = target_tsc - current_tsc;
-    if delta < PEBS_MIN_DELTA + pebs_margin {
+    if delta < min_arm_delta(pebs.mode) + pebs_margin {
         return ArmResult::BelowMinDelta;
     }
     let encoded_delta = delta - pebs_margin;
@@ -369,11 +413,26 @@ pub fn arm_for_next_iteration<C: VmContext>(ctx: &mut C) {
 pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     // The VM-exit MSR-load list already zeroed IA32_PEBS_ENABLE, so these
     // reads see clean host values.
-    let host_pebs_enable = msr.read_msr(msr::IA32_PEBS_ENABLE).unwrap_or(0);
-    let host_ds_area = msr.read_msr(msr::IA32_DS_AREA).unwrap_or(0);
+    let pebs_mode = ctx
+        .state()
+        .pebs_state
+        .as_deref()
+        .expect("pebs_pre_vm_entry called without registered pebs_state")
+        .mode;
+    let is_pebs = pebs_mode == PreciseExitMode::Pebs;
+    // PEBS-only MSRs may not exist in PMI mode.
+    let read_pebs_msr = |index| {
+        if is_pebs {
+            msr.read_msr(index).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    let host_pebs_enable = read_pebs_msr(msr::IA32_PEBS_ENABLE);
+    let host_ds_area = read_pebs_msr(msr::IA32_DS_AREA);
     let host_fixed_ctr_ctrl = msr.read_msr(msr::IA32_FIXED_CTR_CTRL).unwrap_or(0);
     let host_fixed_ctr0 = msr.read_msr(msr::IA32_FIXED_CTR0).unwrap_or(0);
-    let host_pebs_data_cfg = msr.read_msr(msr::MSR_PEBS_DATA_CFG).unwrap_or(0);
+    let host_pebs_data_cfg = read_pebs_msr(msr::MSR_PEBS_DATA_CFG);
 
     let pmc0_value = ctx.state().instruction_counter.read();
 
@@ -414,7 +473,7 @@ pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     //
     // Clearing overflow status (6) prevents a stale buffered record from
     // flushing on re-enable.
-    let values = [
+    let pebs_values = [
         pmc0_value,
         0,
         pebs.counter_reload,
@@ -425,15 +484,32 @@ pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
         pebs.pebs_enable,
         guest_perf_global_ctrl,
     ];
+    // Same order as `PMI_ENTRY_MSR_INDEXES`: the PEBS list without its
+    // PEBS-only MSRs; status reset keeps a stale overflow from raising a PMI
+    // on entry.
+    let pmi_values = [
+        pmc0_value,
+        0,
+        pebs.counter_reload,
+        pebs.fixed_ctr_ctrl,
+        GLOBAL_STATUS_FIXED_CTR0_OVF,
+        guest_perf_global_ctrl,
+    ];
+    let (indexes, values): (&[u32], &[u64]) = if is_pebs {
+        (&PEBS_ENTRY_MSR_INDEXES, &pebs_values)
+    } else {
+        (&PMI_ENTRY_MSR_INDEXES, &pmi_values)
+    };
 
     // 16-byte entries: u32 index, u32 reserved, u64 value (SDM Vol 3C Table
-    // 26-16). Indexes were set at VmState construction.
-    // SAFETY: page is 4KB, page-aligned; we touch bytes within the 9-entry
-    // MSR-load area (9 * 16 = 144), well within bounds.
+    // 26-16). Indexes are rewritten each time since the list depends on mode.
+    // SAFETY: page is 4KB, page-aligned; we touch bytes within the at most
+    // 9-entry MSR-load area (9 * 16 = 144), well within bounds.
     unsafe {
-        for (i, value) in values.iter().enumerate() {
-            let value_ptr = (entry_load_va as *mut u8).add(i * 16 + 8).cast::<u64>();
-            core::ptr::write(value_ptr, *value);
+        for (i, (index, value)) in indexes.iter().zip(values).enumerate() {
+            let entry_ptr = (entry_load_va as *mut u8).add(i * 16);
+            core::ptr::write(entry_ptr.cast::<u32>(), *index);
+            core::ptr::write(entry_ptr.add(8).cast::<u64>(), *value);
         }
     }
 
@@ -449,8 +525,18 @@ pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
 
 /// Undo `pebs_pre_vm_entry`: hand the MSR-load list back to the instruction
 /// counter and restore host PMU MSRs. Safe because the VM-exit MSR-load list
-/// already zeroed `IA32_PEBS_ENABLE`.
+/// already zeroed `IA32_PEBS_ENABLE` (PEBS mode); in PMI mode, the host
+/// `IA32_PERF_GLOBAL_CTRL` loaded at exit has kept FC0 from counting further.
+///
+/// PMI mode also claims our overflow PMI here, where MSR access is at hand.
 pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
+    if ctx.state().pebs_state.as_deref().map(|p| p.mode) == Some(PreciseExitMode::Pmi) {
+        let fired = claim_pmi(ctx, msr);
+        if let Some(p) = ctx.state_mut().pebs_state.as_deref_mut() {
+            p.pmi_fired = fired;
+        }
+    }
+
     // Null instruction counter: no page, so load nothing.
     if let Some(ic_phys) = ctx.state().instruction_counter.msr_save_load_entry_phys() {
         let _ = ctx
@@ -475,9 +561,64 @@ pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
         .expect("pebs_post_vm_exit called without registered pebs_state");
     let _ = msr.write_msr(msr::IA32_FIXED_CTR_CTRL, pebs.host_msrs.fixed_ctr_ctrl);
     let _ = msr.write_msr(msr::IA32_FIXED_CTR0, pebs.host_msrs.fixed_ctr0);
-    let _ = msr.write_msr(msr::IA32_DS_AREA, pebs.host_msrs.ds_area);
-    let _ = msr.write_msr(msr::MSR_PEBS_DATA_CFG, pebs.host_msrs.pebs_data_cfg);
-    let _ = msr.write_msr(msr::IA32_PEBS_ENABLE, pebs.host_msrs.pebs_enable);
+    if pebs.mode == PreciseExitMode::Pebs {
+        let _ = msr.write_msr(msr::IA32_DS_AREA, pebs.host_msrs.ds_area);
+        let _ = msr.write_msr(msr::MSR_PEBS_DATA_CFG, pebs.host_msrs.pebs_data_cfg);
+        let _ = msr.write_msr(msr::IA32_PEBS_ENABLE, pebs.host_msrs.pebs_enable);
+    }
+}
+
+/// PMI mode: if this exit is an NMI and `IA32_FIXED_CTR0` overflowed, it is
+/// our PMI. Ack the overflow and unmask LVTPC (LAPIC masks it on delivery;
+/// perf's handler would normally unmask it), so `handle_exception_nmi` can
+/// swallow the NMI instead of forwarding it to perf as an unknown NMI.
+///
+/// An overflow that raced a different exit reason is left alone: its NMI is
+/// still pending and reaches the host handler, which acks it. Either way the
+/// next arming reloads the counter and the MTF margin covers the target.
+fn claim_pmi<C: VmContext, M: MsrAccess>(ctx: &C, msr: &M) -> bool {
+    let status = msr.read_msr(msr::IA32_PERF_GLOBAL_STATUS).unwrap_or(0);
+    if status & GLOBAL_STATUS_FIXED_CTR0_OVF == 0 {
+        return false;
+    }
+    let vmcs = &ctx.state().vmcs;
+    let reason = vmcs.read32(VmcsField32::VmExitReason).unwrap_or(u32::MAX) & 0xFFFF;
+    let info = vmcs
+        .read32(VmcsField32::VmExitInterruptionInfo)
+        .unwrap_or(0);
+    // Exit reason 0 with a valid NMI-type interruption (SDM Vol 3C 25.9.2).
+    let is_nmi = reason == ExitReason::ExceptionNmi as u32
+        && info & (1 << 31) != 0
+        && (info >> 8) & 0x7 == 2;
+    if !is_nmi {
+        return false;
+    }
+    let _ = msr.write_msr(
+        msr::IA32_PERF_GLOBAL_STATUS_RESET,
+        GLOBAL_STATUS_FIXED_CTR0_OVF,
+    );
+    // x2APIC is a precondition of PMI mode (`host_supports_pmi_precise_exit`).
+    if let Ok(lvtpc) = msr.read_msr(msr::X2APIC_LVTPC) {
+        let _ = msr.write_msr(msr::X2APIC_LVTPC, lvtpc & !APIC_LVT_MASKED);
+    }
+    true
+}
+
+/// LVT mask bit (SDM Vol 3A Figure 13-8).
+const APIC_LVT_MASKED: u64 = 1 << 16;
+
+/// Whether the host can deliver precise exits by PMI: architectural PMU v2+
+/// with at least one fixed counter (CPUID.0AH, SDM Vol 3B 21.2.2), and the
+/// LAPIC in x2APIC mode so `claim_pmi` can unmask LVTPC with an MSR write.
+pub fn host_supports_pmi_precise_exit<M: MsrAccess>(msr: &M) -> bool {
+    let (eax, _, _, edx) = super::cpuid::cpuid(0xA, 0);
+    let version = eax & 0xFF;
+    let fixed_counters = edx & 0x1F;
+    // IA32_APIC_BASE: bit 11 = enable, bit 10 = x2APIC.
+    let x2apic = msr
+        .read_msr(msr::IA32_APIC_BASE)
+        .is_ok_and(|v| v & (0b11 << 10) == (0b11 << 10));
+    version >= 2 && fixed_counters >= 1 && x2apic
 }
 
 /// True if the EPT violation is a PEBS record write. Qualification bit 16
@@ -491,8 +632,9 @@ pub fn is_pebs_induced(qual: &EptViolationQualification) -> bool {
 #[repr(u64)]
 pub enum RegisterPebsPageResult {
     Success = 0,
-    /// Host lacks EPT-friendly PEBS (`PEBS_BASELINE` clear, `PEBS_FMT < 4`,
-    /// or `IA32_PERF_CAPABILITIES` absent).
+    /// Host lacks both EPT-friendly PEBS (`PEBS_BASELINE` clear,
+    /// `PEBS_FMT < 4`, or `IA32_PERF_CAPABILITIES` absent) and the PMI
+    /// fallback (`host_supports_pmi_precise_exit`).
     Unsupported = u64::MAX,
     /// Guest virtual address is not 4KB-aligned.
     Misaligned = u64::MAX - 1,
@@ -557,16 +699,44 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
     allocator: &mut A,
     page_va: u64,
 ) -> RegisterPebsPageResult {
-    if !ctx.state().pebs_supported {
+    let mode = if ctx.state().pebs_supported {
+        PreciseExitMode::Pebs
+    } else if ctx.state().pmi_supported {
+        PreciseExitMode::Pmi
+    } else {
         // E.g. nested under KVM. Once registered, every VM-entry would touch
-        // PEBS MSRs and #GP.
+        // PMU MSRs and #GP.
         return RegisterPebsPageResult::Unsupported;
-    }
+    };
     if page_va & 0xFFF != 0 {
         return RegisterPebsPageResult::Misaligned;
     }
     if ctx.state().pebs_state.is_some() {
         return RegisterPebsPageResult::AlreadyRegistered;
+    }
+    if mode == PreciseExitMode::Pmi {
+        // No scratch page, EPT remap or VM-exit MSR-load list needed.
+        enable_guest_fixed_ctr0(ctx);
+        ctx.state_mut().pebs_state = Some(heap_box(PebsState {
+            mode,
+            ds_management_gpa: 0,
+            pebs_buffer_gpa: 0,
+            ds_area_va: 0,
+            armed_action: None,
+            armed_target_tsc: 0,
+            armed_inst_count: 0,
+            armed_tsc_offset: 0,
+            iters_since_arm: 0,
+            counter_reload: 0,
+            fixed_ctr_ctrl: FIXED_CTR_CTRL_FC0_OS_USR_PMI,
+            pebs_enable: 0,
+            pebs_data_cfg: 0,
+            host_msrs: PebsHostMsrs::default(),
+            logged_first_arm: false,
+            pmi_fired: false,
+        }));
+        log_info!("HYPERCALL_REGISTER_PEBS_PAGE: no EPT-friendly PEBS, using PMI precise exits\n");
+        return RegisterPebsPageResult::Success;
     }
 
     let gpa = match translate_gva_to_gpa(ctx, page_va) {
@@ -621,18 +791,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
         return RegisterPebsPageResult::NotEptMapped;
     }
 
-    // Enable FIXED_CTR0 alongside the instruction counter's PMC0, in guest
-    // context only (SDM Vol 3B 21.4.2).
-    if let Ok(prev) = ctx
-        .state()
-        .vmcs
-        .read64(VmcsField64::GuestIa32PerfGlobalCtrl)
-    {
-        let _ = ctx.state().vmcs.write64(
-            VmcsField64::GuestIa32PerfGlobalCtrl,
-            prev | PERF_GLOBAL_CTRL_FIXED_CTR0,
-        );
-    }
+    enable_guest_fixed_ctr0(ctx);
 
     // Zero IA32_PEBS_ENABLE atomically on every VM-exit. A record can still
     // be pending after the eventing instruction (SDM Vol 3B 21.9.4/21.9.5);
@@ -648,6 +807,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
     // `pebs_pre_vm_entry` / `pebs_post_vm_exit`.
 
     ctx.state_mut().pebs_state = Some(heap_box(PebsState {
+        mode,
         ds_management_gpa: gpa_page,
         pebs_buffer_gpa: gpa_page,
         ds_area_va: kernel_va,
@@ -663,6 +823,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
         pebs_data_cfg: 0,
         host_msrs: PebsHostMsrs::default(),
         logged_first_arm: false,
+        pmi_fired: false,
     }));
 
     log_info!(
@@ -675,12 +836,28 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
     RegisterPebsPageResult::Success
 }
 
+/// Enable FIXED_CTR0 alongside the instruction counter's PMC0, in guest
+/// context only (SDM Vol 3B 21.4.2).
+fn enable_guest_fixed_ctr0<C: VmContext>(ctx: &mut C) {
+    if let Ok(prev) = ctx
+        .state()
+        .vmcs
+        .read64(VmcsField64::GuestIa32PerfGlobalCtrl)
+    {
+        let _ = ctx.state().vmcs.write64(
+            VmcsField64::GuestIa32PerfGlobalCtrl,
+            prev | PERF_GLOBAL_CTRL_FIXED_CTR0,
+        );
+    }
+}
+
 #[cfg(all(test, feature = "cargo"))]
 mod tests {
     use super::*;
 
     fn make_pebs_state() -> PebsState {
         PebsState {
+            mode: PreciseExitMode::Pebs,
             ds_management_gpa: 0x1000,
             pebs_buffer_gpa: 0x1000,
             ds_area_va: 0xffff_8000_0000_1000,
@@ -695,6 +872,7 @@ mod tests {
             pebs_data_cfg: 0,
             host_msrs: PebsHostMsrs::default(),
             logged_first_arm: false,
+            pmi_fired: false,
         }
     }
 
@@ -709,7 +887,7 @@ mod tests {
     #[test]
     fn arm_below_min_delta_returns_below_min_delta() {
         let mut p = make_pebs_state();
-        let target = 100 + PEBS_MIN_DELTA + get_pebs_margin() - 1;
+        let target = 100 + PEBS_MIN_DELTA + get_pebs_margin(PreciseExitMode::Pebs) - 1;
         let r = arm_precise_exit(&mut p, 100, target, PebsAction::InjectInterrupt(0x20), 0, 0);
         assert_eq!(r, ArmResult::BelowMinDelta);
         assert!(p.armed_action.is_none());
@@ -719,7 +897,7 @@ mod tests {
     fn arm_minimum_delta_writes_correct_counter_reload() {
         let mut p = make_pebs_state();
         // Smallest delta that arms.
-        let delta = PEBS_MIN_DELTA + get_pebs_margin();
+        let delta = PEBS_MIN_DELTA + get_pebs_margin(PreciseExitMode::Pebs);
         let r = arm_precise_exit(
             &mut p,
             100,
@@ -729,10 +907,13 @@ mod tests {
             0,
         );
         assert_eq!(r, ArmResult::Armed);
-        let encoded = delta - get_pebs_margin();
+        let encoded = delta - get_pebs_margin(PreciseExitMode::Pebs);
         assert_eq!(p.counter_reload, encoded.wrapping_neg() & PMC_COUNTER_MASK);
         // Tracks the firing point, not the requested target.
-        assert_eq!(p.armed_target_tsc, 100 + delta - get_pebs_margin());
+        assert_eq!(
+            p.armed_target_tsc,
+            100 + delta - get_pebs_margin(PreciseExitMode::Pebs)
+        );
         assert!(matches!(
             p.armed_action,
             Some(PebsAction::InjectInterrupt(0x20))
@@ -745,11 +926,24 @@ mod tests {
         let delta: u64 = 1_000_000;
         let r = arm_precise_exit(&mut p, 0, delta, PebsAction::InjectInterrupt(0x20), 0, 0);
         assert_eq!(r, ArmResult::Armed);
-        let encoded = delta - get_pebs_margin();
+        let encoded = delta - get_pebs_margin(PreciseExitMode::Pebs);
         let expected = encoded.wrapping_neg() & PMC_COUNTER_MASK;
         assert_eq!(p.counter_reload, expected);
         let wrapped = p.counter_reload.wrapping_add(encoded) & PMC_COUNTER_MASK;
         assert_eq!(wrapped, 0);
+    }
+
+    #[test]
+    fn arm_pmi_mode_uses_pmi_margin() {
+        let mut p = make_pebs_state();
+        p.mode = PreciseExitMode::Pmi;
+        let delta: u64 = 1_000_000;
+        let r = arm_precise_exit(&mut p, 0, delta, PebsAction::InjectInterrupt(0x20), 0, 0);
+        assert_eq!(r, ArmResult::Armed);
+        assert_eq!(p.armed_target_tsc, delta - PMI_MARGIN);
+        let below = PMI_MARGIN;
+        let r = arm_precise_exit(&mut p, 0, below, PebsAction::InjectInterrupt(0x20), 0, 0);
+        assert_eq!(r, ArmResult::BelowMinDelta);
     }
 
     #[test]

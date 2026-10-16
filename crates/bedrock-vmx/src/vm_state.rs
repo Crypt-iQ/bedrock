@@ -16,8 +16,8 @@ type ExitStatsBox = HeapBox<AllExitStats>;
 /// is its stable position in this vector.
 pub type FeedbackBuffers = HeapVec<HeapBox<FeedbackBufferInfo>>;
 
-/// PEBS VM-entry MSR-load list entries, in fixed order. Indexes are written
-/// once by `init_pebs_entry_msr_indexes`; `pebs_pre_vm_entry` fills values.
+/// PEBS VM-entry MSR-load list entries, in fixed order; `pebs_pre_vm_entry`
+/// writes indexes and values.
 ///
 /// - Entry 0 (`IA32_A_PMC0`): while armed this page replaces the instruction
 ///   counter's (IC, on `IA32_PMC0`) entry-load page, so it must reload the IC's
@@ -42,17 +42,16 @@ pub const PEBS_ENTRY_MSR_INDEXES: [u32; 9] = [
     msr::IA32_PERF_GLOBAL_CTRL,
 ];
 
-/// Write the MSR-index fields of the PEBS VM-entry MSR-load page. Entries are
-/// 16 bytes: u32 index, u32 reserved, u64 value (SDM Vol 3C Table 26-16).
-fn init_pebs_entry_msr_indexes(page_virt: u64) {
-    let base = page_virt as *mut u32;
-    for (i, &msr_index) in PEBS_ENTRY_MSR_INDEXES.iter().enumerate() {
-        // SAFETY: page is freshly allocated and 4KB; we touch bytes 0..144.
-        unsafe {
-            core::ptr::write(base.add(i * 4), msr_index);
-        }
-    }
-}
+/// PMI-mode counterpart of `PEBS_ENTRY_MSR_INDEXES`, minus the PEBS-only
+/// MSRs (which may not exist on hosts that fall back to PMI).
+pub const PMI_ENTRY_MSR_INDEXES: [u32; 6] = [
+    msr::IA32_A_PMC0,
+    msr::IA32_PERF_GLOBAL_CTRL,
+    msr::IA32_FIXED_CTR0,
+    msr::IA32_FIXED_CTR_CTRL,
+    msr::IA32_PERF_GLOBAL_STATUS_RESET,
+    msr::IA32_PERF_GLOBAL_CTRL,
+];
 
 /// Create an empty feedback-buffers vector.
 fn feedback_buffers_new() -> FeedbackBuffers {
@@ -834,6 +833,9 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// Host supports EPT-friendly PEBS (`PEBS_BASELINE` and `PEBS_FMT >= 4`).
     /// Cached because reading `IA32_PERF_CAPABILITIES` may `#GP`.
     pub pebs_supported: bool,
+    /// Host can fall back to PMI-delivered precise exits. See
+    /// `exits::pebs::host_supports_pmi_precise_exit`.
+    pub pmi_supported: bool,
     /// Hypervisor↔guest I/O channel. See `IoChannelState`.
     pub io_channel: IoChannelState,
     /// Paravirtual batch console. See `SerialConsoleState`.
@@ -903,7 +905,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .kernel()
             .alloc_zeroed_page()
             .ok_or(VmStateError::PebsExitMsrLoadAlloc)?;
-        init_pebs_entry_msr_indexes(pebs_entry_msr_load_page.virtual_address().as_u64());
 
         // Passthrough MSRs that are saved/restored either by VMCS guest-state
         // fields or manually around entry/exit.
@@ -967,6 +968,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .read_msr(msr::IA32_PERF_CAPABILITIES)
             .map(|v| (v >> 14) & 1 != 0 && ((v >> 8) & 0xF) >= 4)
             .unwrap_or(false);
+        let pmi_supported = host_supports_pmi_precise_exit(machine.msr_access());
 
         vmcs.setup(ept.eptp(), Some(msr_bitmap.physical_address()), &host_state)
             .map_err(VmStateError::VmcsSetup)?;
@@ -1036,6 +1038,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             intercept_pf: false,
             pebs_state: None,
             pebs_supported,
+            pmi_supported,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -1809,6 +1812,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             intercept_pf: false,
             pebs_state: None,
             pebs_supported: false,
+            pmi_supported: false,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -1859,7 +1863,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .kernel()
             .alloc_zeroed_page()
             .ok_or(VmStateError::PebsExitMsrLoadAlloc)?;
-        init_pebs_entry_msr_indexes(pebs_entry_msr_load_page.virtual_address().as_u64());
 
         let guest_xsave_page = machine
             .kernel()
@@ -1919,7 +1922,12 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             // The copied exit-load address points at the parent's page (the
             // parent may free it first), and `register_pebs_page` won't run
             // again. Entry-load fields are rewritten every iteration.
-            if parent_state.pebs_state.is_some() {
+            // PMI mode uses no exit-load list.
+            if parent_state
+                .pebs_state
+                .as_deref()
+                .is_some_and(|p| p.mode == PreciseExitMode::Pebs)
+            {
                 vmcs.write64(
                     VmcsField64::VmExitMsrLoadAddr,
                     pebs_exit_msr_load_page.physical_address().as_u64(),
@@ -2027,6 +2035,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 .as_deref()
                 .map(|p| heap_box(p.clone_for_fork())),
             pebs_supported: parent_state.pebs_supported,
+            pmi_supported: parent_state.pmi_supported,
             io_channel: IoChannelState::clone_for_fork(&parent_state.io_channel),
             serial_console: SerialConsoleState::clone_for_fork(&parent_state.serial_console),
             last_cpu: None,

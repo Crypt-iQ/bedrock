@@ -8,6 +8,8 @@
 pub mod msr {
     /// APIC base address and flags.
     pub const IA32_APIC_BASE: u32 = 0x1B;
+    /// x2APIC LVT Performance Monitoring Counters register.
+    pub const X2APIC_LVTPC: u32 = 0x834;
     /// Control features in Intel 64 processor.
     pub const IA32_FEATURE_CONTROL: u32 = 0x3A;
     /// Per logical processor TSC adjust.

@@ -23,6 +23,17 @@ pub fn handle_exception_nmi<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
     // An NMI exit is a host NMI: service it with the host handler right away
     // (as KVM and bhyve do), or host watchdogs can fire. No-op in cargo builds.
     if matches!(info.interruption_type, InterruptionType::Nmi) {
+        // Our own PMI-mode precise exit, already acked by `pebs_post_vm_exit`;
+        // perf has no event for it, so don't forward it.
+        let pmi_fired = ctx
+            .state_mut()
+            .pebs_state
+            .as_deref_mut()
+            .is_some_and(|p| core::mem::take(&mut p.pmi_fired));
+        if pmi_fired {
+            return super::pebs::handle_pebs_precise_exit(ctx);
+        }
+
         // SAFETY: INT 2 invokes the host NMI handler to service the NMI that
         // caused this VM exit.
         #[cfg(all(target_arch = "x86_64", not(feature = "cargo")))]

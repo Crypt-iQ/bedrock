@@ -78,18 +78,18 @@ pub use bedrock_ept::{EptMemoryType, EptPageTable, EptPermissions, FrameAllocato
 #[cfg(not(feature = "cargo"))]
 pub use super::exits::{
     arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit,
-    get_pebs_margin, handle_exit, inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry,
-    update_mtf_state, ArmResult, DsManagementArea, ExitError, ExitHandlerResult, ExitReason,
-    PebsAction, PebsState, APIC_BASE, APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ,
-    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
+    get_pebs_margin, handle_exit, host_supports_pmi_precise_exit, inject_pending_interrupt,
+    pebs_post_vm_exit, pebs_pre_vm_entry, update_mtf_state, ArmResult, DsManagementArea, ExitError,
+    ExitHandlerResult, ExitReason, PebsAction, PebsState, PreciseExitMode, APIC_BASE, APIC_SIZE,
+    IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ, PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
 };
 #[cfg(feature = "cargo")]
 pub use crate::exits::{
     arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit,
-    get_pebs_margin, handle_exit, inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry,
-    update_mtf_state, ArmResult, DsManagementArea, ExitError, ExitHandlerResult, ExitReason,
-    PebsAction, PebsState, APIC_BASE, APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ,
-    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
+    get_pebs_margin, handle_exit, host_supports_pmi_precise_exit, inject_pending_interrupt,
+    pebs_post_vm_exit, pebs_pre_vm_entry, update_mtf_state, ArmResult, DsManagementArea, ExitError,
+    ExitHandlerResult, ExitReason, PebsAction, PebsState, PreciseExitMode, APIC_BASE, APIC_SIZE,
+    IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ, PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
 };
 
 // Logging
@@ -150,14 +150,16 @@ pub use super::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
     FeedbackBuffers, IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState,
     VmStateBox, VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN,
-    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
+    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PEBS_ENTRY_MSR_INDEXES, PENDING_IO_QUEUE_CAP,
+    PMI_ENTRY_MSR_INDEXES, SERIAL_CONSOLE_PAGE_SIZE,
 };
 #[cfg(feature = "cargo")]
 pub use crate::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
     FeedbackBuffers, IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState,
     VmStateBox, VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN,
-    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
+    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PEBS_ENTRY_MSR_INDEXES, PENDING_IO_QUEUE_CAP,
+    PMI_ENTRY_MSR_INDEXES, SERIAL_CONSOLE_PAGE_SIZE,
 };
 
 // Kernel VM file handles
