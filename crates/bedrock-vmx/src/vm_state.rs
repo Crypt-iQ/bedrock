@@ -961,13 +961,11 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             0,
         );
 
-        // EPT-friendly PEBS needs PEBS_BASELINE (bit 14) and PEBS_FMT >= 4
-        // (bits 11:8); a `#GP` on the read means unsupported (SDM Vol 3B 21.8).
+        // A `#GP` on the read means unsupported (SDM Vol 3B 21.8).
         let pebs_supported = machine
             .msr_access()
             .read_msr(msr::IA32_PERF_CAPABILITIES)
-            .map(|v| (v >> 14) & 1 != 0 && ((v >> 8) & 0xF) >= 4)
-            .unwrap_or(false);
+            .is_ok_and(host_has_ept_friendly_pebs);
         let pmi_supported = host_supports_pmi_precise_exit(machine.msr_access());
 
         vmcs.setup(ept.eptp(), Some(msr_bitmap.physical_address()), &host_state)

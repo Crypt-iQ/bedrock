@@ -231,6 +231,31 @@ fn margin_for_host_cpu() -> u64 {
     }
 }
 
+/// Whether the host has EPT-friendly PEBS, given `IA32_PERF_CAPABILITIES`.
+/// Needs PEBS_BASELINE (bit 14) plus either PEBS_FMT (bits 11:8) >= 5 or a
+/// format-4 server part known to be EPT-friendly. Client format-4 parts (Ice
+/// Lake, Tiger Lake) are not, so a guest-mode record write could bypass EPT.
+/// Mirrors Linux `x86_pmu.pebs_ept` (`intel_ds_init`, `intel_pmu_init`).
+pub fn host_has_ept_friendly_pebs(perf_capabilities: u64) -> bool {
+    let baseline = (perf_capabilities >> 14) & 1 != 0;
+    let format = (perf_capabilities >> 8) & 0xF;
+    if !baseline || format < 4 {
+        return false;
+    }
+    if format >= 5 {
+        return true;
+    }
+    matches!(
+        host_family_model(),
+        (0x6, 0x6A)     // Ice Lake-SP
+            | (0x6, 0x6C) // Ice Lake-D
+            | (0x6, 0x8F) // Sapphire Rapids-SP
+            | (0x6, 0xCF) // Emerald Rapids
+            | (0x6, 0xAD) // Granite Rapids-SP
+            | (0x6, 0xAE) // Granite Rapids-D
+    )
+}
+
 /// Host family/model from CPUID.01H:EAX (SDM Vol 1 21.3).
 fn host_family_model() -> (u32, u32) {
     let (eax, _, _, _) = super::cpuid::cpuid(1, 0);
