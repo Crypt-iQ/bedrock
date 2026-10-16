@@ -233,9 +233,12 @@ fn margin_for_host_cpu() -> u64 {
 
 /// Whether the host has EPT-friendly PEBS, given `IA32_PERF_CAPABILITIES`.
 /// Needs PEBS_BASELINE (bit 14) plus either PEBS_FMT (bits 11:8) >= 5 or a
-/// format-4 server part known to be EPT-friendly. Client format-4 parts (Ice
-/// Lake, Tiger Lake) are not, so a guest-mode record write could bypass EPT.
-/// Mirrors Linux `x86_pmu.pebs_ept` (`intel_ds_init`, `intel_pmu_init`).
+/// format-4 part listed as EPT-friendly: Ice Lake server and later, and 12th
+/// gen Core and later (SDM Vol 3B 21.9.5, Tables 21-51/21-53). Other
+/// format-4 parts (client Ice Lake, Tiger Lake, Rocket Lake, Tremont) are
+/// not: DS Area accesses there must never fault or exit (Vol 3B 19.4.9),
+/// which the R+E scratch page relies on. Linux `x86_pmu.pebs_ept` is similar
+/// but omits the client hybrid parts.
 pub fn host_has_ept_friendly_pebs(perf_capabilities: u64) -> bool {
     let baseline = (perf_capabilities >> 14) & 1 != 0;
     let format = (perf_capabilities >> 8) & 0xF;
@@ -253,6 +256,14 @@ pub fn host_has_ept_friendly_pebs(perf_capabilities: u64) -> bool {
             | (0x6, 0xCF) // Emerald Rapids
             | (0x6, 0xAD) // Granite Rapids-SP
             | (0x6, 0xAE) // Granite Rapids-D
+            | (0x6, 0x97) // Alder Lake
+            | (0x6, 0x9A) // Alder Lake-L
+            | (0x6, 0xBE) // Alder Lake-N
+            | (0x6, 0xB7) // Raptor Lake
+            | (0x6, 0xBA) // Raptor Lake-P
+            | (0x6, 0xBF) // Raptor Lake-S
+            | (0x6, 0xAA) // Meteor Lake-L
+            | (0x6, 0xAC) // Meteor Lake
     )
 }
 
