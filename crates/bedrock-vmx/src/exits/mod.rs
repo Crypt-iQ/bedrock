@@ -27,8 +27,10 @@ pub use interrupts::{
 pub use pebs::{
     arm_for_next_iteration, arm_precise_exit, disarm_precise_exit, get_pebs_margin,
     host_has_ept_friendly_pebs, host_supports_pmi_precise_exit, min_arm_delta, pebs_post_vm_exit,
-    pebs_pre_vm_entry, ArmResult, DsManagementArea, PebsAction, PebsHostMsrs, PebsState,
-    PreciseExitMode, PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
+    pebs_pre_vm_entry, pmi_trace_dump, pmi_trace_record, ArmResult, DsManagementArea, PebsAction,
+    PebsHostMsrs, PebsState, PmiTrace, PmiTraceEntry, PmiTraceHeader, PreciseExitMode,
+    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0, PMI_TRACE_ARMED, PMI_TRACE_DIAG_MAGIC,
+    PMI_TRACE_LEN,
 };
 pub use qualifications::{
     CrAccessQualification, EptViolationQualification, IoQualification, RdrandInstructionInfo,

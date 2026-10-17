@@ -290,6 +290,14 @@ where
     // the guard's lifetime.
     let pmi_guard = PrecisePmiGuard::new(machine.kernel(), pmi_mode);
 
+    // The PMI flight recorder costs a few VMREADs/RDMSRs per exit (~8% on the
+    // bitcoin workload), so it only runs when diagnostic events are wanted.
+    let pmi_trace = pmi_mode
+        && ctx
+            .state()
+            .event_categories
+            .contains(EventCategories::DIAGNOSTIC);
+
     let loop_result = loop {
         let loop_start_tsc = rdtsc();
 
@@ -348,6 +356,10 @@ where
             let _irq_window = ReverseIrqGuard::new(machine.kernel());
             let count = ctx.state().instruction_counter.read();
             ctx.state_mut().last_instruction_count = count;
+        }
+
+        if pmi_trace {
+            pmi_trace_record(ctx, msr, pebs_armed_this_iter);
         }
         let post_irq_tsc = rdtsc();
         ctx.state_mut().exit_stats.irq_window_cycles += post_irq_tsc.saturating_sub(pre_irq_tsc);

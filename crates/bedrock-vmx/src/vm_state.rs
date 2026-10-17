@@ -146,6 +146,44 @@ fn box_serial_line_buf() -> SerialLineBufBox {
     }
 }
 
+/// Heap-allocated PMI flight recorder; boxed for the same stack reason as
+/// [`IoPageBufBox`].
+pub type PmiTraceBox = VmallocBox<PmiTrace>;
+
+/// Allocate a zeroed PMI flight recorder directly on the heap.
+#[cfg(feature = "cargo")]
+fn box_pmi_trace() -> PmiTraceBox {
+    extern crate alloc;
+    let layout = core::alloc::Layout::new::<PmiTrace>();
+    // SAFETY: `PmiTrace` has non-zero size; all-zero bytes are a valid
+    // `PmiTrace` (only integer fields), and the pointer comes from the global
+    // allocator with `PmiTrace`'s layout, as `Box::from_raw` requires.
+    unsafe {
+        let ptr = alloc::alloc::alloc_zeroed(layout).cast::<PmiTrace>();
+        if ptr.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        alloc::boxed::Box::from_raw(ptr)
+    }
+}
+
+#[cfg(not(feature = "cargo"))]
+fn box_pmi_trace() -> PmiTraceBox {
+    let mut boxed: kernel::alloc::KVBox<core::mem::MaybeUninit<PmiTrace>> =
+        kernel::alloc::KVBox::new_uninit(kernel::alloc::flags::GFP_KERNEL)
+            .expect("Failed to allocate PMI flight recorder");
+    // SAFETY: we zero-fill the entire allocation before `assume_init`, and
+    // all-zero bytes are a valid `PmiTrace` (only integer fields).
+    unsafe {
+        core::ptr::write_bytes(
+            boxed.as_mut_ptr().cast::<u8>(),
+            0,
+            core::mem::size_of::<PmiTrace>(),
+        );
+        boxed.assume_init()
+    }
+}
+
 /// Maximum I/O channel requests queued behind the in-flight slot. Bounds heap
 /// use to ~`PENDING_IO_QUEUE_CAP * IO_CHANNEL_BUF_SIZE`.
 pub const PENDING_IO_QUEUE_CAP: usize = 256;
@@ -742,6 +780,8 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     pub pebs_entry_msr_load_page: V::P,
     /// Early-boot serial line accumulator. See `SERIAL_LINE_ACC_SIZE`.
     pub serial_line_buf: SerialLineBufBox,
+    /// PMI-mode flight recorder, dumped on a missed precise exit.
+    pub pmi_trace: PmiTraceBox,
     /// Number of valid bytes in `serial_line_buf`.
     pub serial_line_len: usize,
     /// Emulated TSC at the line's first byte; stamps the emitted event.
@@ -1014,6 +1054,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
             serial_line_buf: box_serial_line_buf(),
+            pmi_trace: box_pmi_trace(),
             serial_line_len: 0,
             serial_line_tsc: 0,
             serial_line_real_tsc: 0,
@@ -1191,6 +1232,35 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 payload.len(),
                 core::ptr::null(),
                 0,
+            )
+        }
+    }
+
+    /// Append one event from two payload parts only if it fits now; never
+    /// stages, so it cannot displace a record waiting for the drain. Returns
+    /// whether it was written (or filtered out).
+    pub fn event_try_append_parts(&mut self, kind: EventKind, head: &[u8], tail: &[u8]) -> bool {
+        if !self.event_categories.contains(kind.category()) {
+            return true;
+        }
+        let need = EVENT_HEADER_SIZE + align_up(head.len() + tail.len(), 8);
+        if self.event_pending.is_some() || self.event_len + need > EVENT_BUFFER_SIZE {
+            return false;
+        }
+        let tsc = self.emulated_tsc;
+        let real_tsc = rdtsc();
+        // SAFETY: both slices are valid and never alias the event buffer; the
+        // room check above means `event_write` will not stage.
+        unsafe {
+            self.event_write(
+                kind,
+                kind.default_flags(),
+                tsc,
+                real_tsc,
+                head.as_ptr(),
+                head.len(),
+                tail.as_ptr(),
+                tail.len(),
             )
         }
     }
@@ -1789,6 +1859,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
             serial_line_buf: box_serial_line_buf(),
+            pmi_trace: box_pmi_trace(),
             serial_line_len: 0,
             serial_line_tsc: 0,
             serial_line_real_tsc: 0,
@@ -2008,6 +2079,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
             serial_line_buf: box_serial_line_buf(),
+            pmi_trace: box_pmi_trace(),
             serial_line_len: 0,
             serial_line_tsc: 0,
             serial_line_real_tsc: 0,

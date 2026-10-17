@@ -73,6 +73,11 @@ pub fn check_apic_timer<C: VmContext>(ctx: &mut C) {
     let _ = ctx
         .state_mut()
         .event_append(EventKind::Inject, payload.as_bytes());
+
+    // After the inject record, so the dump can never take its staging slot.
+    if current_tsc > timer_deadline {
+        super::pebs::pmi_trace_dump(ctx, timer_deadline, current_tsc);
+    }
 }
 
 /// Raise the I/O channel IRQ for a queued, undelivered request once the guest

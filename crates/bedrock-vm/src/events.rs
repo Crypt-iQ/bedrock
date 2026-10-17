@@ -114,6 +114,12 @@ impl<'a> EventRecord<'a> {
                 len: bytes.len(),
             },
             Event::IoChannel(p, data) => io_channel_body(p, data),
+            Event::Unknown { kind, payload } if kind == EventKind::Diagnostic.as_u16() => {
+                EventBody::Diagnostic {
+                    len: payload.len(),
+                    hex: payload.iter().map(|b| format!("{b:02x}")).collect(),
+                }
+            }
             Event::Unknown { kind, payload } => EventBody::Unknown {
                 kind,
                 len: payload.len(),
@@ -252,6 +258,11 @@ pub enum EventBody<'a> {
         output_len: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<Cow<'a, str>>,
+    },
+    /// Host-derived debugging payload (e.g. the PMI flight recorder), as hex.
+    Diagnostic {
+        len: usize,
+        hex: String,
     },
     Unknown {
         kind: u16,

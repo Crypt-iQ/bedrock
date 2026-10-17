@@ -1650,6 +1650,7 @@ mod pmi_delivery {
             logged_first_arm: false,
             pmi_fired: false,
             pmi_forward: false,
+            last_exit_fc0: 0,
         }));
         ctx
     }
@@ -1718,6 +1719,35 @@ mod pmi_delivery {
         let msrs = RecordingMsrs::with(&[(msr::IA32_PERF_GLOBAL_STATUS, FC1_OVF)]);
         pebs_post_vm_exit(&mut ctx, &msrs);
         assert_eq!(claim(&ctx), (false, false));
+    }
+
+    #[test]
+    fn flight_recorder_keeps_the_newest_exits_oldest_first() {
+        use crate::exits::{pmi_trace_dump, pmi_trace_record, PMI_TRACE_LEN};
+
+        let mut ctx = pmi_ctx();
+        ctx.set_exit_reason(ExitReason::Rdtsc);
+        let msrs = RecordingMsrs::default();
+        let total = PMI_TRACE_LEN + 6;
+        for i in 0..total {
+            ctx.state_mut().last_instruction_count = i as u64;
+            pmi_trace_record(&mut ctx, &msrs, i % 2 == 0);
+        }
+        pmi_trace_dump(&mut ctx, 100, 200);
+
+        let trace = &*ctx.state().pmi_trace;
+        assert_eq!(trace.dumps, 1);
+        assert_eq!(trace.head, 0);
+        assert_eq!(trace.entries[0].inst_count, 6);
+        assert_eq!(
+            trace.entries[PMI_TRACE_LEN - 1].inst_count,
+            (total - 1) as u64
+        );
+        assert_eq!(trace.entries[0].exit_reason, ExitReason::Rdtsc as u32);
+        assert_eq!(
+            trace.entries[0].flags & crate::exits::PMI_TRACE_ARMED,
+            crate::exits::PMI_TRACE_ARMED
+        );
     }
 
     #[test]

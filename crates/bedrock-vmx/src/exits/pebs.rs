@@ -131,6 +131,9 @@ pub struct PebsState {
     /// PMI mode: with `pmi_fired`, other counters had overflowed too, so the
     /// NMI must still reach the host handler (e.g. the NMI watchdog's sample).
     pub pmi_forward: bool,
+    /// PMI mode: `IA32_FIXED_CTR0` read at the last armed exit, before the
+    /// host value is restored (flight-recorder diagnostics).
+    pub last_exit_fc0: u64,
 }
 
 impl PebsState {
@@ -159,6 +162,7 @@ impl PebsState {
             logged_first_arm: false,
             pmi_fired: false,
             pmi_forward: false,
+            last_exit_fc0: 0,
         }
     }
 }
@@ -595,7 +599,18 @@ fn unmask_lvtpc<M: MsrAccess>(msr: &M) -> bool {
 pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     if ctx.state().pebs_state.as_deref().map(|p| p.mode) == Some(PreciseExitMode::Pmi) {
         let claim = claim_pmi(ctx, msr);
+        // Flight-recorder only (see `pmi_trace_record`).
+        let fc0 = if ctx
+            .state()
+            .event_categories
+            .contains(EventCategories::DIAGNOSTIC)
+        {
+            msr.read_msr(msr::IA32_FIXED_CTR0).unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(p) = ctx.state_mut().pebs_state.as_deref_mut() {
+            p.last_exit_fc0 = fc0;
             p.pmi_fired = claim != PmiClaim::NotOurs;
             p.pmi_forward = claim == PmiClaim::OursAndOthers;
         }
@@ -683,6 +698,230 @@ fn claim_pmi<C: VmContext, M: MsrAccess>(ctx: &C, msr: &M) -> PmiClaim {
     }
     unmask_lvtpc(msr);
     PmiClaim::Ours
+}
+
+/// PMI flight recorder depth: run-loop exits kept for the late-inject dump.
+pub const PMI_TRACE_LEN: usize = 64;
+/// Late-inject dumps emitted per VM; later misses only show in the stats.
+const PMI_TRACE_MAX_DUMPS: u32 = 4;
+
+/// `PmiTraceEntry::flags`: the iteration entered with a precise exit armed.
+pub const PMI_TRACE_ARMED: u32 = 1 << 0;
+/// `PmiTraceEntry::flags`: MTF was enabled for the iteration.
+pub const PMI_TRACE_MTF: u32 = 1 << 1;
+/// `PmiTraceEntry::flags`: `claim_pmi` claimed this exit as our PMI.
+pub const PMI_TRACE_CLAIMED: u32 = 1 << 2;
+/// `PmiTraceEntry::flags`: the claimed NMI was also forwarded to the host.
+pub const PMI_TRACE_FORWARD: u32 = 1 << 3;
+
+/// One run-loop exit as seen by the PMI flight recorder. Host-derived and
+/// non-deterministic; only ever emitted as a `Diagnostic` event.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PmiTraceEntry {
+    /// `last_instruction_count` after the exit.
+    pub inst_count: u64,
+    pub tsc_offset: u64,
+    /// `PebsState::armed_target_tsc` at the exit (firing point, not deadline).
+    pub armed_target_tsc: u64,
+    /// `IA32_PERF_GLOBAL_STATUS` read after the exit.
+    pub global_status: u64,
+    /// Basic exit reason (bits 15:0).
+    pub exit_reason: u32,
+    /// Guest interruptibility state saved by the exit.
+    pub interruptibility: u32,
+    /// x2APIC LVTPC read after the exit.
+    pub lvtpc: u32,
+    /// `PMI_TRACE_*` bits.
+    pub flags: u32,
+    /// `IA32_FIXED_CTR0` at the exit (armed exits only; else stale).
+    pub fc0: u64,
+    /// `IA32_FIXED_CTR0` reload value of the last arming.
+    pub counter_reload: u64,
+    /// `MSR_SMI_COUNT` after the exit; a change between two entries means an
+    /// SMI landed in between.
+    pub smi_count: u64,
+}
+
+/// Ring of the most recent PMI-mode exits, dumped when a precise exit is
+/// missed (a late timer inject). Heap-allocated with `VmState`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PmiTrace {
+    pub entries: [PmiTraceEntry; PMI_TRACE_LEN],
+    /// Next slot to write.
+    pub head: u32,
+    /// Dumps emitted so far.
+    pub dumps: u32,
+    /// SMI records emitted so far.
+    pub smi_records: u32,
+    /// `MSR_SMI_COUNT` at the previous exit (0 = none yet).
+    pub last_smi_count: u64,
+    /// `last_instruction_count` at the previous exit.
+    pub last_inst_count: u64,
+}
+
+/// One SMI observed between two consecutive PMI-mode exits; emitted as a
+/// `Diagnostic` event with magic `PMI_SMI_DIAG_MAGIC`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PmiSmiRecord {
+    pub magic: u32,
+    /// Basic exit reason of the exit that ended the iteration.
+    pub exit_reason: u32,
+    /// Instructions counted by `IA32_PMC0` over the iteration.
+    pub inst_delta: u64,
+    /// SMIs counted over the iteration.
+    pub smi_delta: u64,
+    /// `PMI_TRACE_*` flags of the iteration (MTF => a single-step entry).
+    pub flags: u32,
+    pub _pad: u32,
+}
+
+/// "PMIS".
+pub const PMI_SMI_DIAG_MAGIC: u32 = 0x5349_4d50;
+/// SMI records emitted per VM.
+const PMI_SMI_MAX_RECORDS: u32 = 256;
+
+/// Header of a PMI flight-recorder `Diagnostic` event; followed by up to
+/// `PMI_TRACE_LEN` `PmiTraceEntry`s, oldest first.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PmiTraceHeader {
+    /// Diagnostic record type; `PMI_TRACE_DIAG_MAGIC` for this layout.
+    pub magic: u32,
+    /// Size of each following entry.
+    pub entry_size: u32,
+    /// The missed APIC timer deadline.
+    pub deadline: u64,
+    /// Emulated TSC at which it was delivered instead.
+    pub delivered_tsc: u64,
+}
+
+/// "PMIT".
+pub const PMI_TRACE_DIAG_MAGIC: u32 = 0x5449_4d50;
+
+/// Record the exit that just happened into the PMI flight recorder. Called
+/// from the run loop after `last_instruction_count` is refreshed; PMI mode
+/// only.
+pub fn pmi_trace_record<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M, armed_this_iter: bool) {
+    let (armed_target_tsc, claimed, forward, fc0, counter_reload) =
+        match ctx.state().pebs_state.as_deref() {
+            Some(p) if p.mode == PreciseExitMode::Pmi => (
+                p.armed_target_tsc,
+                p.pmi_fired,
+                p.pmi_forward,
+                p.last_exit_fc0,
+                p.counter_reload,
+            ),
+            _ => return,
+        };
+    let vmcs = &ctx.state().vmcs;
+    let exit_reason = vmcs.read32(VmcsField32::VmExitReason).unwrap_or(u32::MAX) & 0xFFFF;
+    let interruptibility = vmcs
+        .read32(VmcsField32::GuestInterruptibilityState)
+        .unwrap_or(u32::MAX);
+    let mut flags = 0;
+    if armed_this_iter {
+        flags |= PMI_TRACE_ARMED;
+    }
+    if ctx.state().mtf_enabled {
+        flags |= PMI_TRACE_MTF;
+    }
+    if claimed {
+        flags |= PMI_TRACE_CLAIMED;
+    }
+    if forward {
+        flags |= PMI_TRACE_FORWARD;
+    }
+    let entry = PmiTraceEntry {
+        inst_count: ctx.state().last_instruction_count,
+        tsc_offset: ctx.state().tsc_offset,
+        armed_target_tsc,
+        global_status: msr.read_msr(msr::IA32_PERF_GLOBAL_STATUS).unwrap_or(0),
+        exit_reason,
+        interruptibility,
+        lvtpc: msr.read_msr(msr::X2APIC_LVTPC).unwrap_or(0) as u32,
+        flags,
+        fc0,
+        counter_reload,
+        smi_count: msr.read_msr(msr::MSR_SMI_COUNT).unwrap_or(0),
+    };
+    let state = ctx.state_mut();
+    let trace = &mut *state.pmi_trace;
+    let slot = trace.head as usize % PMI_TRACE_LEN;
+    trace.entries[slot] = entry;
+    trace.head = trace.head.wrapping_add(1);
+
+    let smi_delta = entry.smi_count.wrapping_sub(trace.last_smi_count);
+    let inst_delta = entry.inst_count.wrapping_sub(trace.last_inst_count);
+    let report =
+        trace.last_smi_count != 0 && smi_delta != 0 && trace.smi_records < PMI_SMI_MAX_RECORDS;
+    trace.last_smi_count = entry.smi_count;
+    trace.last_inst_count = entry.inst_count;
+    if report {
+        trace.smi_records += 1;
+        let record = PmiSmiRecord {
+            magic: PMI_SMI_DIAG_MAGIC,
+            exit_reason: entry.exit_reason,
+            inst_delta,
+            smi_delta,
+            flags: entry.flags,
+            _pad: 0,
+        };
+        // SAFETY: `repr(C)` with only integer fields and no padding.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(&record).cast::<u8>(),
+                core::mem::size_of::<PmiSmiRecord>(),
+            )
+        };
+        state.event_try_append_parts(EventKind::Diagnostic, bytes, &[]);
+    }
+}
+
+/// Emit the PMI flight recorder as a `Diagnostic` event after a missed
+/// precise exit. Only writes if the event buffer has room, so it can never
+/// displace the deterministic records staged for a drain.
+pub fn pmi_trace_dump<C: VmContext>(ctx: &mut C, deadline: u64, delivered_tsc: u64) {
+    if ctx.state().pebs_state.as_deref().map(|p| p.mode) != Some(PreciseExitMode::Pmi) {
+        return;
+    }
+    let state = ctx.state_mut();
+    if state.pmi_trace.dumps >= PMI_TRACE_MAX_DUMPS {
+        return;
+    }
+    state.pmi_trace.dumps += 1;
+    // Oldest first: rotate so the slot after the newest becomes index 0.
+    let filled = (state.pmi_trace.head as usize).min(PMI_TRACE_LEN);
+    let head = state.pmi_trace.head as usize % PMI_TRACE_LEN;
+    if filled == PMI_TRACE_LEN {
+        state.pmi_trace.entries.rotate_left(head);
+        state.pmi_trace.head = 0;
+    }
+    let header = PmiTraceHeader {
+        magic: PMI_TRACE_DIAG_MAGIC,
+        entry_size: core::mem::size_of::<PmiTraceEntry>() as u32,
+        deadline,
+        delivered_tsc,
+    };
+    // SAFETY: both types are `repr(C)` with only u32/u64 fields and no
+    // padding, so viewing them as bytes is well-defined.
+    let (header_bytes, entry_bytes) = unsafe {
+        (
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(&header).cast::<u8>(),
+                core::mem::size_of::<PmiTraceHeader>(),
+            ),
+            core::slice::from_raw_parts(
+                state.pmi_trace.entries.as_ptr().cast::<u8>(),
+                filled * core::mem::size_of::<PmiTraceEntry>(),
+            ),
+        )
+    };
+    state.event_try_append_parts(EventKind::Diagnostic, header_bytes, entry_bytes);
+    // Start the next dump's window fresh.
+    state.pmi_trace.head = 0;
 }
 
 /// LVT mask bit (SDM Vol 3A Figure 13-8).
@@ -816,6 +1055,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
             logged_first_arm: false,
             pmi_fired: false,
             pmi_forward: false,
+            last_exit_fc0: 0,
         }));
         log_info!("HYPERCALL_REGISTER_PEBS_PAGE: no EPT-friendly PEBS, using PMI precise exits\n");
         return RegisterPebsPageResult::Success;
@@ -907,6 +1147,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
         logged_first_arm: false,
         pmi_fired: false,
         pmi_forward: false,
+        last_exit_fc0: 0,
     }));
 
     log_info!(
@@ -957,6 +1198,7 @@ mod tests {
             logged_first_arm: false,
             pmi_fired: false,
             pmi_forward: false,
+            last_exit_fc0: 0,
         }
     }
 
