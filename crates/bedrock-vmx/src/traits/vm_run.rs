@@ -112,6 +112,17 @@ where
     // Requires the VMCS to be loaded.
     ctx.state().apply_intercept_pf();
 
+    // Freeze the counters across SMIs so SMM code never lands in the guest
+    // instruction count. Guest DEBUGCTL accesses are emulated (reads 0,
+    // writes ignored), so the VMCS field is ours; it is rewritten every run
+    // because `set_registers` resets it.
+    if ctx.state().freeze_perfmon_in_smm {
+        let _ = ctx
+            .state()
+            .vmcs
+            .write64(VmcsField64::GuestIa32Debugctl, DEBUGCTL_FREEZE_WHILE_SMM);
+    }
+
     // Otherwise single-stepping would only start at the first exit.
     update_mtf_state(ctx).map_err(VmRunError::ExitHandler)?;
 
