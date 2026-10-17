@@ -276,6 +276,12 @@ pub(crate) struct BedrockExitStats {
     pub apic_timer_late_inject: u64,
     /// Largest PEBS skid this run; minimum safe `margin_for_host_cpu()` value.
     pub max_pebs_skid: i64,
+    /// PMI mode: armed entries that found LVTPC masked.
+    pub pmi_lvtpc_unmasked: u64,
+    /// PMI mode: claimed NMI exits also forwarded to the host handler.
+    pub pmi_nmi_forwarded: u64,
+    /// PMI mode: our overflow PMIs claimed in host context.
+    pub pmi_host_claims: u64,
 }
 
 /// VM exit information returned from the RUN ioctl. All other output (incl.

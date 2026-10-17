@@ -590,6 +590,15 @@ pub struct AllExitStats {
     /// Largest PEBS skid this run (`pebs_exit_tsc - armed_target_tsc`); the
     /// minimum safe `exits::pebs::margin_for_host_cpu` for this host.
     pub max_pebs_skid: i64,
+    /// PMI mode: armed entries that found LVTPC masked and unmasked it (a
+    /// PMI had been delivered without anyone re-arming it).
+    pub pmi_lvtpc_unmasked: u64,
+    /// PMI mode: claimed NMI exits forwarded to the host NMI handler because
+    /// other counters had overflowed too (e.g. the NMI watchdog).
+    pub pmi_nmi_forwarded: u64,
+    /// PMI mode: our overflow PMIs claimed by the host NMI handler, i.e.
+    /// delivered in host context instead of as an NMI exit.
+    pub pmi_host_claims: u64,
 }
 
 impl AllExitStats {

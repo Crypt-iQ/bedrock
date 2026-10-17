@@ -57,6 +57,51 @@ pub trait Kernel {
     fn local_irq_enable(&self);
 
     fn local_irq_disable(&self);
+
+    /// Mark this CPU as running a PMI-mode precise-exit loop, so the host NMI
+    /// handler claims our `IA32_FIXED_CTR0` overflow PMIs that land in host
+    /// context (and re-unmasks LVTPC, which Linux perf only does while it has
+    /// active events). Deactivating returns how many such PMIs were claimed
+    /// since activation. No-op outside the kernel.
+    fn set_precise_pmi_active(&self, _active: bool) -> u64 {
+        0
+    }
+}
+
+/// RAII guard that marks the current CPU as running a PMI-mode precise-exit
+/// loop (see [`Kernel::set_precise_pmi_active`]) while held. `None` inside
+/// when PMI mode is not in use, so the guard is a no-op.
+pub struct PrecisePmiGuard<'a, K: Kernel> {
+    kernel: Option<&'a K>,
+}
+
+impl<'a, K: Kernel> PrecisePmiGuard<'a, K> {
+    #[inline]
+    pub fn new(kernel: &'a K, active: bool) -> Self {
+        if active {
+            kernel.set_precise_pmi_active(true);
+        }
+        Self {
+            kernel: active.then_some(kernel),
+        }
+    }
+
+    /// Deactivate and return the host-context PMI claims since activation.
+    #[inline]
+    pub fn finish(mut self) -> u64 {
+        self.kernel
+            .take()
+            .map_or(0, |k| k.set_precise_pmi_active(false))
+    }
+}
+
+impl<K: Kernel> Drop for PrecisePmiGuard<'_, K> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(k) = self.kernel.take() {
+            k.set_precise_pmi_active(false);
+        }
+    }
 }
 
 /// RAII guard that disables local interrupts while held.

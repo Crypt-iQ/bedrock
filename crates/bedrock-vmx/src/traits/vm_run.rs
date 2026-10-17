@@ -8,8 +8,8 @@ use super::super::prelude::*;
 use crate::prelude::*;
 
 use super::{
-    CowAllocator, InstructionCounter, IrqGuard, Kernel, Machine, Page, ReverseIrqGuard,
-    VirtualMachineControlStructure, VmContext, VmRunError, VmRunner,
+    CowAllocator, InstructionCounter, IrqGuard, Kernel, Machine, Page, PrecisePmiGuard,
+    ReverseIrqGuard, VirtualMachineControlStructure, VmContext, VmRunError, VmRunner,
 };
 
 // ========== GPR Sync Methods ==========
@@ -249,11 +249,19 @@ where
     // write would otherwise clobber `register_pebs_page`'s OR and PEBS would
     // never fire.
     let pebs_registered = ctx.state().pebs_state.is_some();
-    if let Some((mut guest_val, host_val)) =
+    let pmi_mode = ctx.state().pebs_state.as_deref().map(|p| p.mode) == Some(PreciseExitMode::Pmi);
+    if let Some((mut guest_val, mut host_val)) =
         ctx.state().instruction_counter.perf_global_ctrl_values()
     {
         if pebs_registered {
             guest_val |= PERF_GLOBAL_CTRL_FIXED_CTR0;
+        }
+        // Linux keeps every counter's global enable set, so without this FC0
+        // would keep counting host instructions, with its PMI bit still set,
+        // until `pebs_post_vm_exit` restores `IA32_FIXED_CTR_CTRL`. An
+        // overflow there raises a PMI we cannot claim on the exit path.
+        if pmi_mode {
+            host_val &= !PERF_GLOBAL_CTRL_FIXED_CTR0;
         }
         let _ = ctx
             .state()
@@ -277,6 +285,10 @@ where
             );
         }
     }
+
+    // Interrupts are off (`_irq_guard`), so the thread stays on this CPU for
+    // the guard's lifetime.
+    let pmi_guard = PrecisePmiGuard::new(machine.kernel(), pmi_mode);
 
     let loop_result = loop {
         let loop_start_tsc = rdtsc();
@@ -391,6 +403,8 @@ where
             }
         }
     };
+
+    ctx.state_mut().exit_stats.pmi_host_claims += pmi_guard.finish();
 
     // Must run on the same CPU as `prepare`.
     let finish_result = ctx

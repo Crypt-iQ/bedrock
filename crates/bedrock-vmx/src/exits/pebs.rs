@@ -128,6 +128,9 @@ pub struct PebsState {
     /// PMI mode: the last NMI exit was our `IA32_FIXED_CTR0` overflow (set by
     /// `pebs_post_vm_exit`, consumed by `handle_exception_nmi`).
     pub pmi_fired: bool,
+    /// PMI mode: with `pmi_fired`, other counters had overflowed too, so the
+    /// NMI must still reach the host handler (e.g. the NMI watchdog's sample).
+    pub pmi_forward: bool,
 }
 
 impl PebsState {
@@ -155,6 +158,7 @@ impl PebsState {
             host_msrs: PebsHostMsrs::default(),
             logged_first_arm: false,
             pmi_fired: false,
+            pmi_forward: false,
         }
     }
 }
@@ -557,19 +561,43 @@ pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
         .state()
         .vmcs
         .write32(VmcsField32::VmEntryMsrLoadCount, values.len() as u32);
+
+    // The LAPIC masks LVTPC on every PMI it delivers. `claim_pmi` and the
+    // host NMI handler re-unmask it for our own PMIs, but any other PMI path
+    // relies on Linux perf, which leaves it masked when it has no active
+    // events; every later overflow would then be silently dropped. x2APIC
+    // MSRs cannot go in the VM-entry MSR-load list (SDM Vol 3C 28.4), so
+    // check here, last thing before entry.
+    if !is_pebs && unmask_lvtpc(msr) {
+        ctx.state_mut().exit_stats.pmi_lvtpc_unmasked += 1;
+    }
+}
+
+/// Clear the LVTPC mask bit if set; returns whether it was masked. x2APIC is
+/// a precondition of PMI mode (`host_supports_pmi_precise_exit`).
+fn unmask_lvtpc<M: MsrAccess>(msr: &M) -> bool {
+    match msr.read_msr(msr::X2APIC_LVTPC) {
+        Ok(lvtpc) if lvtpc & APIC_LVT_MASKED != 0 => {
+            let _ = msr.write_msr(msr::X2APIC_LVTPC, lvtpc & !APIC_LVT_MASKED);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Undo `pebs_pre_vm_entry`: hand the MSR-load list back to the instruction
 /// counter and restore host PMU MSRs. Safe because the VM-exit MSR-load list
 /// already zeroed `IA32_PEBS_ENABLE` (PEBS mode); in PMI mode, the host
-/// `IA32_PERF_GLOBAL_CTRL` loaded at exit has kept FC0 from counting further.
+/// `IA32_PERF_GLOBAL_CTRL` loaded at exit has FC0 cleared (see `run_loop`), so
+/// FC0 stopped counting at the exit.
 ///
 /// PMI mode also claims our overflow PMI here, where MSR access is at hand.
 pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     if ctx.state().pebs_state.as_deref().map(|p| p.mode) == Some(PreciseExitMode::Pmi) {
-        let fired = claim_pmi(ctx, msr);
+        let claim = claim_pmi(ctx, msr);
         if let Some(p) = ctx.state_mut().pebs_state.as_deref_mut() {
-            p.pmi_fired = fired;
+            p.pmi_fired = claim != PmiClaim::NotOurs;
+            p.pmi_forward = claim == PmiClaim::OursAndOthers;
         }
     }
 
@@ -604,18 +632,35 @@ pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     }
 }
 
+/// Outcome of `claim_pmi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PmiClaim {
+    /// Not an NMI exit, or `IA32_FIXED_CTR0` did not overflow.
+    NotOurs,
+    /// Our PMI alone: acked and LVTPC unmasked; the NMI can be swallowed.
+    Ours,
+    /// Our PMI coalesced with other counters' overflows: ours is acked, but
+    /// the NMI must still go to the host handler, which acks the rest and
+    /// unmasks LVTPC.
+    OursAndOthers,
+}
+
 /// PMI mode: if this exit is an NMI and `IA32_FIXED_CTR0` overflowed, it is
 /// our PMI. Ack the overflow and unmask LVTPC (LAPIC masks it on delivery;
 /// perf's handler would normally unmask it), so `handle_exception_nmi` can
 /// swallow the NMI instead of forwarding it to perf as an unknown NMI.
 ///
+/// One NMI carries every counter's overflow, so if others are pending too
+/// (e.g. the NMI watchdog's), LVTPC is left masked and the NMI forwarded;
+/// unmasking with overflow bits still set would only re-raise the PMI.
+///
 /// An overflow that raced a different exit reason is left alone: its NMI is
-/// still pending and reaches the host handler, which acks it. Either way the
-/// next arming reloads the counter and the MTF margin covers the target.
-fn claim_pmi<C: VmContext, M: MsrAccess>(ctx: &C, msr: &M) -> bool {
+/// still pending and the host NMI handler claims it. Either way the next
+/// arming reloads the counter and the MTF margin covers the target.
+fn claim_pmi<C: VmContext, M: MsrAccess>(ctx: &C, msr: &M) -> PmiClaim {
     let status = msr.read_msr(msr::IA32_PERF_GLOBAL_STATUS).unwrap_or(0);
     if status & GLOBAL_STATUS_FIXED_CTR0_OVF == 0 {
-        return false;
+        return PmiClaim::NotOurs;
     }
     let vmcs = &ctx.state().vmcs;
     let reason = vmcs.read32(VmcsField32::VmExitReason).unwrap_or(u32::MAX) & 0xFFFF;
@@ -627,17 +672,17 @@ fn claim_pmi<C: VmContext, M: MsrAccess>(ctx: &C, msr: &M) -> bool {
         && info & (1 << 31) != 0
         && (info >> 8) & 0x7 == 2;
     if !is_nmi {
-        return false;
+        return PmiClaim::NotOurs;
     }
     let _ = msr.write_msr(
         msr::IA32_PERF_GLOBAL_STATUS_RESET,
         GLOBAL_STATUS_FIXED_CTR0_OVF,
     );
-    // x2APIC is a precondition of PMI mode (`host_supports_pmi_precise_exit`).
-    if let Ok(lvtpc) = msr.read_msr(msr::X2APIC_LVTPC) {
-        let _ = msr.write_msr(msr::X2APIC_LVTPC, lvtpc & !APIC_LVT_MASKED);
+    if status & !GLOBAL_STATUS_FIXED_CTR0_OVF != 0 {
+        return PmiClaim::OursAndOthers;
     }
-    true
+    unmask_lvtpc(msr);
+    PmiClaim::Ours
 }
 
 /// LVT mask bit (SDM Vol 3A Figure 13-8).
@@ -770,6 +815,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
             host_msrs: PebsHostMsrs::default(),
             logged_first_arm: false,
             pmi_fired: false,
+            pmi_forward: false,
         }));
         log_info!("HYPERCALL_REGISTER_PEBS_PAGE: no EPT-friendly PEBS, using PMI precise exits\n");
         return RegisterPebsPageResult::Success;
@@ -860,6 +906,7 @@ pub fn register_pebs_page<C: VmContext, A: CowAllocator<C::CowPage>>(
         host_msrs: PebsHostMsrs::default(),
         logged_first_arm: false,
         pmi_fired: false,
+        pmi_forward: false,
     }));
 
     log_info!(
@@ -909,6 +956,7 @@ mod tests {
             host_msrs: PebsHostMsrs::default(),
             logged_first_arm: false,
             pmi_fired: false,
+            pmi_forward: false,
         }
     }
 

@@ -529,6 +529,9 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         pebs_armed_iter_no_fire: stats.pebs_armed_iter_no_fire,
         apic_timer_late_inject: stats.apic_timer_late_inject,
         max_pebs_skid: stats.max_pebs_skid,
+        pmi_lvtpc_unmasked: stats.pmi_lvtpc_unmasked,
+        pmi_nmi_forwarded: stats.pmi_nmi_forwarded,
+        pmi_host_claims: stats.pmi_host_claims,
     };
 
     // SAFETY: Bounded copy of the stack-local `exit_stats` to the user pointer `arg`.

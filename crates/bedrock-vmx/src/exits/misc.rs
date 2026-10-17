@@ -24,14 +24,30 @@ pub fn handle_exception_nmi<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
     // (as KVM and bhyve do), or host watchdogs can fire. No-op in cargo builds.
     if matches!(info.interruption_type, InterruptionType::Nmi) {
         // Our own PMI-mode precise exit, already acked by `pebs_post_vm_exit`;
-        // perf has no event for it, so don't forward it.
-        let pmi_fired = ctx
-            .state_mut()
-            .pebs_state
-            .as_deref_mut()
-            .is_some_and(|p| core::mem::take(&mut p.pmi_fired));
+        // perf has no event for it, so don't forward it unless other
+        // counters' overflows rode on the same NMI.
+        let (pmi_fired, pmi_forward) =
+            ctx.state_mut()
+                .pebs_state
+                .as_deref_mut()
+                .map_or((false, false), |p| {
+                    (
+                        core::mem::take(&mut p.pmi_fired),
+                        core::mem::take(&mut p.pmi_forward),
+                    )
+                });
         if pmi_fired {
-            return super::pebs::handle_pebs_precise_exit(ctx);
+            let result = super::pebs::handle_pebs_precise_exit(ctx);
+            if pmi_forward {
+                ctx.state_mut().exit_stats.pmi_nmi_forwarded += 1;
+                // SAFETY: as below; the host handler services the other
+                // counters' overflows that share this NMI.
+                #[cfg(all(target_arch = "x86_64", not(feature = "cargo")))]
+                unsafe {
+                    core::arch::asm!("int $2", options(nomem, nostack));
+                }
+            }
+            return result;
         }
 
         // SAFETY: INT 2 invokes the host NMI handler to service the NMI that

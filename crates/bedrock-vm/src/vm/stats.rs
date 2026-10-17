@@ -123,6 +123,17 @@ pub struct ExitStats {
     /// Largest PEBS skid (`pebs_exit_tsc - armed_target_tsc`): the minimum safe
     /// `margin_for_host_cpu()` for this host.
     pub max_pebs_skid: i64,
+    /// PMI mode: armed entries that found LVTPC masked and unmasked it.
+    #[serde(default)]
+    pub pmi_lvtpc_unmasked: u64,
+    /// PMI mode: claimed NMI exits also forwarded to the host NMI handler
+    /// because other counters had overflowed too.
+    #[serde(default)]
+    pub pmi_nmi_forwarded: u64,
+    /// PMI mode: overflow PMIs claimed by the host NMI handler (delivered in
+    /// host context rather than as an NMI exit).
+    #[serde(default)]
+    pub pmi_host_claims: u64,
 }
 
 impl ExitStats {
@@ -375,6 +386,21 @@ impl fmt::Display for ExitStatsReport<'_> {
             f,
             "  max pebs skid:      {:>16}  (min safe margin_for_host_cpu)",
             stats.max_pebs_skid
+        )?;
+        writeln!(
+            f,
+            "  pmi lvtpc unmasked: {:>16}",
+            format_count(stats.pmi_lvtpc_unmasked)
+        )?;
+        writeln!(
+            f,
+            "  pmi nmi forwarded:  {:>16}",
+            format_count(stats.pmi_nmi_forwarded)
+        )?;
+        writeln!(
+            f,
+            "  pmi host claims:    {:>16}",
+            format_count(stats.pmi_host_claims)
         )?;
         write!(f, "{TABLE_SEP}")
     }

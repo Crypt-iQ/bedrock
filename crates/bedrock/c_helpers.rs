@@ -64,6 +64,17 @@ extern "C" {
     /// Write an MSR while handling the #GP raised by an unavailable address or value.
     pub(crate) fn bedrock_wrmsr_safe(msr: u32, value: u64) -> core::ffi::c_int;
 
+    /// Register the host NMI handler that claims PMI-mode overflow PMIs
+    /// delivered in host context. Returns 0 or a negative errno.
+    pub(crate) fn bedrock_pmi_nmi_register() -> core::ffi::c_int;
+
+    /// Unregister the handler registered by `bedrock_pmi_nmi_register`.
+    pub(crate) fn bedrock_pmi_nmi_unregister();
+
+    /// Mark the current CPU as running a PMI-mode loop (interrupts must be
+    /// disabled). Deactivating returns the PMIs claimed since activation.
+    pub(crate) fn bedrock_pmi_set_active(active: bool) -> u64;
+
     /// Allocate zeroed memory that can be mapped to userspace.
     pub(crate) fn bedrock_vmalloc_user(size: core::ffi::c_ulong) -> *mut core::ffi::c_void;
 

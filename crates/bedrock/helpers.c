@@ -17,8 +17,10 @@
 #include <linux/preempt.h>
 #include <linux/percpu.h>
 #include <linux/xxhash.h>
+#include <linux/kprobes.h>
 #include <asm/io.h>
 #include <asm/msr.h>
+#include <asm/nmi.h>
 #include <asm/tlbflush.h>
 
 /*
@@ -140,6 +142,89 @@ int bedrock_wrmsr_safe(u32 msr, u64 value)
 	return wrmsrq_safe(msr, value);
 }
 EXPORT_SYMBOL_GPL(bedrock_wrmsr_safe);
+
+/*
+ * Host NMI handler for PMI-mode precise exits.
+ *
+ * PMI mode arms IA32_FIXED_CTR0 to overflow inside the guest; the PMI arrives
+ * through LVTPC as an NMI. Usually that NMI causes a VM exit and bedrock
+ * claims it, but when the overflow races a different VM exit the NMI lands
+ * in host context instead. The LAPIC masks LVTPC on every PMI delivery, and
+ * Linux perf only unmasks it while it has active events (it bails out early
+ * otherwise), so an unclaimed PMI can leave LVTPC masked and silently drop
+ * every later precise exit. This handler claims our overflow on CPUs that
+ * are currently running a PMI-mode loop and re-unmasks LVTPC.
+ */
+#define BEDROCK_FIXED_CTR0_OVF	BIT_ULL(32)
+#define BEDROCK_X2APIC_LVTPC	0x834
+#define BEDROCK_LVT_MASKED	BIT_ULL(16)
+
+static DEFINE_PER_CPU(bool, bedrock_pmi_active);
+static DEFINE_PER_CPU(u64, bedrock_pmi_host_claims);
+
+static int bedrock_pmi_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+{
+	u64 status, lvtpc;
+
+	if (!this_cpu_read(bedrock_pmi_active))
+		return NMI_DONE;
+
+	rdmsrq(MSR_CORE_PERF_GLOBAL_STATUS, status);
+	if (!(status & BEDROCK_FIXED_CTR0_OVF))
+		return NMI_DONE;
+
+	wrmsrq(MSR_CORE_PERF_GLOBAL_OVF_CTRL, BEDROCK_FIXED_CTR0_OVF);
+	this_cpu_inc(bedrock_pmi_host_claims);
+
+	/*
+	 * With other overflows pending, perf's handler (which runs after us)
+	 * acks them and unmasks; unmasking now would just re-raise the PMI.
+	 * PMI mode requires x2APIC, so LVTPC is reachable as an MSR.
+	 */
+	if (!(status & ~BEDROCK_FIXED_CTR0_OVF)) {
+		rdmsrq(BEDROCK_X2APIC_LVTPC, lvtpc);
+		if (lvtpc & BEDROCK_LVT_MASKED)
+			wrmsrq(BEDROCK_X2APIC_LVTPC, lvtpc & ~BEDROCK_LVT_MASKED);
+	}
+	return NMI_HANDLED;
+}
+NOKPROBE_SYMBOL(bedrock_pmi_nmi_handler);
+
+int bedrock_pmi_nmi_register(void)
+{
+	return register_nmi_handler(NMI_LOCAL, bedrock_pmi_nmi_handler,
+				    NMI_FLAG_FIRST, "bedrock_pmi");
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_nmi_register);
+
+void bedrock_pmi_nmi_unregister(void)
+{
+	unregister_nmi_handler(NMI_LOCAL, "bedrock_pmi");
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_nmi_unregister);
+
+/*
+ * Mark the current CPU as running (or no longer running) a PMI-mode loop.
+ * Must be called with interrupts disabled, so the thread cannot migrate
+ * between activation and deactivation. Deactivation returns the number of
+ * PMIs the handler claimed since activation.
+ */
+u64 bedrock_pmi_set_active(bool active)
+{
+	u64 claims = 0;
+
+	if (active) {
+		this_cpu_write(bedrock_pmi_host_claims, 0);
+		barrier();
+		this_cpu_write(bedrock_pmi_active, true);
+	} else {
+		this_cpu_write(bedrock_pmi_active, false);
+		barrier();
+		claims = this_cpu_read(bedrock_pmi_host_claims);
+	}
+	return claims;
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_set_active);
 
 /*
  * Allocate zeroed memory that can be mapped to userspace.
