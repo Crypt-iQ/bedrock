@@ -181,9 +181,9 @@ fn margin_for_host_cpu() -> u64 {
     // Tuned on the Bitcoin workload (0 late timer injects). Model numbers
     // from Linux `intel-family.h`.
     match (family, model) {
-        (0x6, 0x8F) => 3, // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
-        (0x6, 0x6A) => 8, // Ice Lake-SP (ex: Xeon Silver 4310)
-        _ => 8,           // default for untested models
+        (0x6, 0x8F) => 3,  // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
+        (0x6, 0x6A) => 12, // Ice Lake-SP (ex: Xeon Silver 4310)
+        _ => 8,            // default for untested models
     }
 }
 
