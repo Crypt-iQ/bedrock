@@ -54,6 +54,16 @@ fn init_pebs_entry_msr_indexes(page_virt: u64) {
     }
 }
 
+/// `IA32_PERF_CAPABILITIES` bit 12: `IA32_DEBUGCTL.FREEZE_WHILE_SMM` is
+/// supported (SDM Vol 3B 19.4.1).
+pub const PERF_CAPABILITIES_FREEZE_WHILE_SMM: u64 = 1 << 12;
+
+/// `IA32_DEBUGCTL` bit 14: SMI delivery clears every `IA32_PERF_GLOBAL_CTRL`
+/// enable and RSM restores them, so SMM code is not counted. Without it, an
+/// SMI during guest execution adds the SMM handler's instructions to the
+/// instruction counter which get added to the emulated TSC (SDM Vol 3B 19.4.1).
+pub const DEBUGCTL_FREEZE_WHILE_SMM: u64 = 1 << 14;
+
 /// Create an empty feedback-buffers vector.
 fn feedback_buffers_new() -> FeedbackBuffers {
     heap_vec_with_capacity(0).expect("Failed to allocate feedback buffers")
@@ -834,6 +844,9 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// Host supports EPT-friendly PEBS (`PEBS_BASELINE` and `PEBS_FMT >= 4`).
     /// Cached because reading `IA32_PERF_CAPABILITIES` may `#GP`.
     pub pebs_supported: bool,
+    /// Host supports `IA32_DEBUGCTL.FREEZE_WHILE_SMM` (`IA32_PERF_CAPABILITIES`
+    /// bit 12), so the guest `DEBUGCTL` can freeze the counters across SMIs.
+    pub freeze_perfmon_in_smm: bool,
     /// Hypervisor↔guest I/O channel. See `IoChannelState`.
     pub io_channel: IoChannelState,
     /// Paravirtual batch console. See `SerialConsoleState`.
@@ -968,6 +981,12 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .map(|v| (v >> 14) & 1 != 0 && ((v >> 8) & 0xF) >= 4)
             .unwrap_or(false);
 
+        // Check if this machine supports the FREEZE_WHILE_SMM bit.
+        let freeze_perfmon_in_smm = machine
+            .msr_access()
+            .read_msr(msr::IA32_PERF_CAPABILITIES)
+            .is_ok_and(|caps| caps & PERF_CAPABILITIES_FREEZE_WHILE_SMM != 0);
+
         vmcs.setup(ept.eptp(), Some(msr_bitmap.physical_address()), &host_state)
             .map_err(VmStateError::VmcsSetup)?;
 
@@ -1036,6 +1055,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             intercept_pf: false,
             pebs_state: None,
             pebs_supported,
+            freeze_perfmon_in_smm,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -1809,6 +1829,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             intercept_pf: false,
             pebs_state: None,
             pebs_supported: false,
+            freeze_perfmon_in_smm: false,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -2027,6 +2048,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 .as_deref()
                 .map(|p| heap_box(p.clone_for_fork())),
             pebs_supported: parent_state.pebs_supported,
+            freeze_perfmon_in_smm: parent_state.freeze_perfmon_in_smm,
             io_channel: IoChannelState::clone_for_fork(&parent_state.io_channel),
             serial_console: SerialConsoleState::clone_for_fork(&parent_state.serial_console),
             last_cpu: None,
