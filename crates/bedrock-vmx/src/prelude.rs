@@ -149,15 +149,17 @@ pub use crate::cow::CowPageMap;
 pub use super::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
     FeedbackBuffers, IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState,
-    VmStateBox, VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN,
-    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
+    VmStateBox, VmStateError, DEBUGCTL_FREEZE_WHILE_SMM, DEFAULT_TSC_FREQUENCY,
+    FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE,
+    PENDING_IO_QUEUE_CAP, PERF_CAPABILITIES_FREEZE_WHILE_SMM, SERIAL_CONSOLE_PAGE_SIZE,
 };
 #[cfg(feature = "cargo")]
 pub use crate::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
     FeedbackBuffers, IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState,
-    VmStateBox, VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN,
-    FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
+    VmStateBox, VmStateError, DEBUGCTL_FREEZE_WHILE_SMM, DEFAULT_TSC_FREQUENCY,
+    FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES, IO_CHANNEL_BUF_SIZE,
+    PENDING_IO_QUEUE_CAP, PERF_CAPABILITIES_FREEZE_WHILE_SMM, SERIAL_CONSOLE_PAGE_SIZE,
 };
 
 // Kernel VM file handles
