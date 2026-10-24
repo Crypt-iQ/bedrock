@@ -57,6 +57,41 @@ pub trait Kernel {
     fn local_irq_enable(&self);
 
     fn local_irq_disable(&self);
+
+    /// Mark this CPU as running a PDIR precise-exit loop, so the host NMI
+    /// handler claims our PEBS PMIs that land in host context (and re-unmasks
+    /// LVTPC, which Linux perf only does while it has active events).
+    /// `claim_mask` is the `IA32_PERF_GLOBAL_STATUS` bits that are ours; 0
+    /// deactivates. No-op outside the kernel.
+    fn set_precise_pmi_active(&self, _claim_mask: u64) {}
+}
+
+/// RAII guard that marks the current CPU as running a PDIR precise-exit loop
+/// (see [`Kernel::set_precise_pmi_active`]) while held. `None` inside when
+/// PDIR is not in use, so the guard is a no-op.
+pub struct PrecisePmiGuard<'a, K: Kernel> {
+    kernel: Option<&'a K>,
+}
+
+impl<'a, K: Kernel> PrecisePmiGuard<'a, K> {
+    #[inline]
+    pub fn new(kernel: &'a K, claim_mask: u64) -> Self {
+        if claim_mask != 0 {
+            kernel.set_precise_pmi_active(claim_mask);
+        }
+        Self {
+            kernel: (claim_mask != 0).then_some(kernel),
+        }
+    }
+}
+
+impl<K: Kernel> Drop for PrecisePmiGuard<'_, K> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(k) = self.kernel.take() {
+            k.set_precise_pmi_active(0);
+        }
+    }
 }
 
 /// RAII guard that disables local interrupts while held.
