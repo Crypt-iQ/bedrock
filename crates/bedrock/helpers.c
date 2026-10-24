@@ -17,8 +17,10 @@
 #include <linux/preempt.h>
 #include <linux/percpu.h>
 #include <linux/xxhash.h>
+#include <linux/kprobes.h>
 #include <asm/io.h>
 #include <asm/msr.h>
+#include <asm/nmi.h>
 #include <asm/tlbflush.h>
 
 /*
@@ -142,6 +144,77 @@ int bedrock_wrmsr_safe(u32 msr, u64 value)
 EXPORT_SYMBOL_GPL(bedrock_wrmsr_safe);
 
 /*
+ * Host NMI handler for PDIR precise exits.
+ *
+ * PDIR mode raises a PEBS buffer-threshold PMI inside the guest; Linux routes
+ * it through LVTPC as an NMI. Usually that NMI causes a VM exit and bedrock
+ * claims it, but when the PMI races a different VM exit the NMI lands in host
+ * context instead. The LAPIC masks LVTPC on every PMI delivery, and Linux
+ * perf only unmasks it while it has active events (it bails out early
+ * otherwise), so an unclaimed PMI can leave LVTPC masked and silently drop
+ * every later precise exit. This handler claims our PMI on CPUs that are
+ * currently running a PDIR loop and re-unmasks LVTPC.
+ */
+#define BEDROCK_X2APIC_LVTPC	0x834
+#define BEDROCK_LVT_MASKED	BIT_ULL(16)
+
+/* IA32_PERF_GLOBAL_STATUS bits that are ours; 0 when no loop is running. */
+static DEFINE_PER_CPU(u64, bedrock_pmi_claim_mask);
+
+static int bedrock_pmi_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+{
+	u64 status, lvtpc, claim;
+
+	claim = this_cpu_read(bedrock_pmi_claim_mask);
+	if (!claim)
+		return NMI_DONE;
+
+	rdmsrq(MSR_CORE_PERF_GLOBAL_STATUS, status);
+	if (!(status & claim))
+		return NMI_DONE;
+
+	wrmsrq(MSR_CORE_PERF_GLOBAL_OVF_CTRL, claim);
+
+	/*
+	 * With other overflows pending, perf's handler (which runs after us)
+	 * acks them and unmasks; unmasking now would just re-raise the PMI.
+	 * PDIR mode requires x2APIC, so LVTPC is reachable as an MSR.
+	 */
+	if (!(status & ~claim)) {
+		rdmsrq(BEDROCK_X2APIC_LVTPC, lvtpc);
+		if (lvtpc & BEDROCK_LVT_MASKED)
+			wrmsrq(BEDROCK_X2APIC_LVTPC, lvtpc & ~BEDROCK_LVT_MASKED);
+	}
+	return NMI_HANDLED;
+}
+NOKPROBE_SYMBOL(bedrock_pmi_nmi_handler);
+
+int bedrock_pmi_nmi_register(void)
+{
+	return register_nmi_handler(NMI_LOCAL, bedrock_pmi_nmi_handler,
+				    NMI_FLAG_FIRST, "bedrock_pmi");
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_nmi_register);
+
+void bedrock_pmi_nmi_unregister(void)
+{
+	unregister_nmi_handler(NMI_LOCAL, "bedrock_pmi");
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_nmi_unregister);
+
+/*
+ * Mark the current CPU as running a PDIR loop whose PMIs show as claim_mask
+ * in IA32_PERF_GLOBAL_STATUS, or (claim_mask 0) no longer running. Must be
+ * called with interrupts disabled, so the thread cannot migrate between
+ * activation and deactivation.
+ */
+void bedrock_pmi_set_active(u64 claim_mask)
+{
+	this_cpu_write(bedrock_pmi_claim_mask, claim_mask);
+}
+EXPORT_SYMBOL_GPL(bedrock_pmi_set_active);
+
+/*
  * Allocate zeroed memory that can be mapped to userspace.
  * This wraps vmalloc_user() which allocates virtually contiguous memory
  * that is suitable for mmap'ing to userspace.
@@ -149,7 +222,6 @@ EXPORT_SYMBOL_GPL(bedrock_wrmsr_safe);
 void *bedrock_vmalloc_user(unsigned long size)
 {
 	return vmalloc_user(size);
-}
 EXPORT_SYMBOL_GPL(bedrock_vmalloc_user);
 
 /*

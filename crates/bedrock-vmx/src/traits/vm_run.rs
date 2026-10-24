@@ -8,8 +8,8 @@ use super::super::prelude::*;
 use crate::prelude::*;
 
 use super::{
-    CowAllocator, InstructionCounter, IrqGuard, Kernel, Machine, Page, ReverseIrqGuard,
-    VirtualMachineControlStructure, VmContext, VmRunError, VmRunner,
+    CowAllocator, InstructionCounter, IrqGuard, Kernel, Machine, Page, PrecisePmiGuard,
+    ReverseIrqGuard, VirtualMachineControlStructure, VmContext, VmRunError, VmRunner,
 };
 
 // ========== GPR Sync Methods ==========
@@ -243,15 +243,25 @@ where
 
     // Hardware PERF_GLOBAL_CTRL switching, constant for the loop.
     //
-    // Re-add the PEBS FIXED_CTR0 bit: the IC's snapshot lacks it, so this
-    // write would otherwise clobber `register_pebs_page`'s OR and PEBS would
-    // never fire.
-    let pebs_registered = ctx.state().pebs_state.is_some();
-    if let Some((mut guest_val, host_val)) =
+    // Re-add the PEBS FIXED_CTR0 (or PDIR PMC1) bit: the IC's snapshot lacks
+    // it, so this write would otherwise clobber `register_pebs_page`'s OR and
+    // PEBS would never fire.
+    let mode = ctx.state().pebs_state.as_deref().map(|p| p.mode);
+    let pdir_mode = mode == Some(PreciseExitMode::Pdir);
+    if let Some((mut guest_val, mut host_val)) =
         ctx.state().instruction_counter.perf_global_ctrl_values()
     {
-        if pebs_registered {
-            guest_val |= PERF_GLOBAL_CTRL_FIXED_CTR0;
+        match mode {
+            Some(PreciseExitMode::Pebs) => guest_val |= PERF_GLOBAL_CTRL_FIXED_CTR0,
+            Some(PreciseExitMode::Pdir) => guest_val |= PMC1_BIT,
+            None => {}
+        }
+        // Linux keeps every counter's global enable set, so without this PDIR
+        // would keep counting host instructions until `pebs_post_vm_exit`
+        // restores its event select. An overflow there raises a PMI we cannot
+        // claim on the exit path.
+        if pdir_mode {
+            host_val &= !PMC1_BIT;
         }
         let _ = ctx
             .state()
@@ -275,6 +285,13 @@ where
             );
         }
     }
+
+    // Interrupts are off (`_irq_guard`), so the thread stays on this CPU for
+    // the guard's lifetime.
+    let _pmi_guard = PrecisePmiGuard::new(
+        machine.kernel(),
+        if pdir_mode { PDIR_PMI_CLAIM_MASK } else { 0 },
+    );
 
     let loop_result = loop {
         let loop_start_tsc = rdtsc();

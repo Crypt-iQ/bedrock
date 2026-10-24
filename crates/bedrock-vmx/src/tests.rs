@@ -1578,3 +1578,170 @@ fn test_vmcall_get_random_exit_to_userspace_roundtrip() {
     assert_eq!(&payload[..hdr_size], expected_hdr.as_bytes());
     assert_eq!(&payload[hdr_size..], staged.as_slice());
 }
+
+// PDIR precise exit delivery (PEBS buffer-threshold PMI as a host NMI)
+
+mod pdir_delivery {
+    use super::*;
+    use crate::exits::{
+        pebs_post_vm_exit, pebs_pre_vm_entry, PebsHostMsrs, PebsState, PreciseExitMode,
+    };
+    use crate::registers::{msr, MsrAccess, MsrError};
+    use core::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// `IA32_PERF_GLOBAL_STATUS`: OvfDSBuffer (our PMI) and PDIR's PMC1.
+    const OURS: u64 = (1 << 62) | (1 << 1);
+    /// A foreign overflow sharing the NMI (e.g. the NMI watchdog's counter).
+    const FOREIGN_OVF: u64 = 1 << 33;
+    /// Every bit `pebs_post_vm_exit` acks for us.
+    const CLAIM_MASK: u64 = (1 << 62) | (1 << 1);
+    const LVT_MASKED: u64 = 1 << 16;
+    /// x2APIC LVTPC: NMI delivery mode.
+    const LVTPC_NMI: u64 = 0x400;
+    /// VM-exit interruption info: valid, type NMI (2), vector 2.
+    const NMI_EXIT_INFO: u32 = (1 << 31) | (2 << 8) | 2;
+
+    /// MSR mock backed by a map; records every write.
+    #[derive(Default)]
+    struct RecordingMsrs {
+        values: RefCell<BTreeMap<u32, u64>>,
+        writes: RefCell<Vec<(u32, u64)>>,
+    }
+
+    impl RecordingMsrs {
+        fn with(values: &[(u32, u64)]) -> Self {
+            let m = Self::default();
+            m.values.borrow_mut().extend(values.iter().copied());
+            m
+        }
+        fn get(&self, index: u32) -> u64 {
+            self.values.borrow().get(&index).copied().unwrap_or(0)
+        }
+        fn wrote(&self, index: u32, value: u64) -> bool {
+            self.writes.borrow().contains(&(index, value))
+        }
+    }
+
+    impl MsrAccess for RecordingMsrs {
+        fn read_msr(&self, index: u32) -> Result<u64, MsrError> {
+            Ok(self.get(index))
+        }
+        fn write_msr(&self, index: u32, value: u64) -> Result<(), MsrError> {
+            self.writes.borrow_mut().push((index, value));
+            self.values.borrow_mut().insert(index, value);
+            Ok(())
+        }
+    }
+
+    fn pdir_ctx() -> MockVmContext {
+        let mut ctx = MockVmContext::new();
+        ctx.state_mut().pebs_state = Some(crate::prelude::heap_box(PebsState {
+            mode: PreciseExitMode::Pdir,
+            ds_management_gpa: 0,
+            pebs_buffer_gpa: 0,
+            ds_area_va: 0,
+            armed_action: None,
+            armed_target_tsc: 0,
+            armed_inst_count: 0,
+            armed_tsc_offset: 0,
+            iters_since_arm: 0,
+            counter_reload: 0,
+            fixed_ctr_ctrl: 0,
+            pebs_enable: 0b10,
+            pebs_data_cfg: 0,
+            host_msrs: PebsHostMsrs::default(),
+            logged_first_arm: false,
+            pmi_fired: false,
+            pmi_forward: false,
+        }));
+        ctx
+    }
+
+    fn set_nmi_exit(ctx: &MockVmContext) {
+        ctx.set_exit_reason(ExitReason::ExceptionNmi);
+        ctx.set_exit_qualification(0);
+        ctx.state()
+            .vmcs
+            .set_field32(VmcsField32::VmExitInterruptionInfo, NMI_EXIT_INFO);
+    }
+
+    fn claim(ctx: &MockVmContext) -> (bool, bool) {
+        let p = ctx.state().pebs_state.as_deref().unwrap();
+        (p.pmi_fired, p.pmi_forward)
+    }
+
+    #[test]
+    fn our_pmi_alone_is_acked_unmasked_and_swallowed() {
+        let mut ctx = pdir_ctx();
+        set_nmi_exit(&ctx);
+        let msrs = RecordingMsrs::with(&[
+            (msr::IA32_PERF_GLOBAL_STATUS, OURS),
+            (msr::X2APIC_LVTPC, LVTPC_NMI | LVT_MASKED),
+        ]);
+        pebs_post_vm_exit(&mut ctx, &msrs);
+        assert_eq!(claim(&ctx), (true, false));
+        assert!(msrs.wrote(msr::IA32_PERF_GLOBAL_STATUS_RESET, CLAIM_MASK));
+        assert_eq!(msrs.get(msr::X2APIC_LVTPC), LVTPC_NMI);
+
+        let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+        assert!(matches!(result, ExitHandlerResult::Continue), "{result:?}");
+        assert_eq!(claim(&ctx), (false, false));
+    }
+
+    #[test]
+    fn coalesced_foreign_overflow_is_forwarded_with_lvtpc_left_masked() {
+        let mut ctx = pdir_ctx();
+        set_nmi_exit(&ctx);
+        let msrs = RecordingMsrs::with(&[
+            (msr::IA32_PERF_GLOBAL_STATUS, OURS | FOREIGN_OVF),
+            (msr::X2APIC_LVTPC, LVTPC_NMI | LVT_MASKED),
+        ]);
+        pebs_post_vm_exit(&mut ctx, &msrs);
+        assert_eq!(claim(&ctx), (true, true));
+        // Only our bits are acked; the host handler owns the rest and unmasks.
+        assert!(msrs.wrote(msr::IA32_PERF_GLOBAL_STATUS_RESET, CLAIM_MASK));
+        assert_eq!(msrs.get(msr::X2APIC_LVTPC), LVTPC_NMI | LVT_MASKED);
+    }
+
+    #[test]
+    fn overflow_racing_another_exit_is_left_for_the_host_handler() {
+        let mut ctx = pdir_ctx();
+        ctx.set_exit_reason(ExitReason::Rdtsc);
+        let msrs = RecordingMsrs::with(&[(msr::IA32_PERF_GLOBAL_STATUS, OURS)]);
+        pebs_post_vm_exit(&mut ctx, &msrs);
+        assert_eq!(claim(&ctx), (false, false));
+        assert!(!msrs.wrote(msr::IA32_PERF_GLOBAL_STATUS_RESET, CLAIM_MASK));
+    }
+
+    #[test]
+    fn foreign_nmi_without_our_overflow_is_not_claimed() {
+        let mut ctx = pdir_ctx();
+        set_nmi_exit(&ctx);
+        let msrs = RecordingMsrs::with(&[(msr::IA32_PERF_GLOBAL_STATUS, FOREIGN_OVF)]);
+        pebs_post_vm_exit(&mut ctx, &msrs);
+        assert_eq!(claim(&ctx), (false, false));
+    }
+
+    #[test]
+    fn armed_entry_unmasks_a_masked_lvtpc() {
+        let mut ctx = pdir_ctx();
+        let msrs = RecordingMsrs::with(&[(msr::X2APIC_LVTPC, LVTPC_NMI | LVT_MASKED)]);
+        pebs_pre_vm_entry(&mut ctx, &msrs);
+        assert_eq!(msrs.get(msr::X2APIC_LVTPC), LVTPC_NMI);
+    }
+
+    #[test]
+    fn host_counters_are_restored_after_the_exit() {
+        let mut ctx = pdir_ctx();
+        let msrs = RecordingMsrs::with(&[(msr::IA32_PMC1, 0x11), (msr::IA32_PERFEVTSEL1, 0x22)]);
+        pebs_pre_vm_entry(&mut ctx, &msrs);
+        // The guest's values would be loaded here by the MSR-load list.
+        for index in [msr::IA32_PMC1, msr::IA32_PERFEVTSEL1] {
+            msrs.values.borrow_mut().insert(index, 0xdead);
+        }
+        pebs_post_vm_exit(&mut ctx, &msrs);
+        assert_eq!(msrs.get(msr::IA32_PMC1), 0x11);
+        assert_eq!(msrs.get(msr::IA32_PERFEVTSEL1), 0x22);
+    }
+}

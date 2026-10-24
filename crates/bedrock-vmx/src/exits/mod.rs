@@ -26,8 +26,9 @@ pub use interrupts::{
 };
 pub use pebs::{
     arm_for_next_iteration, arm_precise_exit, disarm_precise_exit, get_pebs_margin,
-    pebs_post_vm_exit, pebs_pre_vm_entry, ArmResult, DsManagementArea, PebsAction, PebsState,
-    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
+    host_supports_pdir_precise_exit, min_arm_delta, pebs_post_vm_exit, pebs_pre_vm_entry,
+    ArmResult, DsManagementArea, PebsAction, PebsHostMsrs, PebsState, PreciseExitMode,
+    PDIR_PMI_CLAIM_MASK, PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0, PMC1_BIT,
 };
 pub use qualifications::{
     CrAccessQualification, EptViolationQualification, IoQualification, RdrandInstructionInfo,
@@ -118,12 +119,12 @@ fn next_single_step_start_count<C: VmContext>(ctx: &C) -> Option<u64> {
     next_single_step_start_tsc(ctx).map(|t| t.saturating_sub(ctx.state().tsc_offset))
 }
 
-/// Width of the MTF window before a precise-exit target. Covers both the PEBS
-/// margin and the `BelowMinDelta` case, where PEBS can't arm and MTF must step
-/// the whole remaining distance; a narrower window would let such a target
-/// fire at a run-dependent later exit.
-fn get_mtf_margin() -> u64 {
-    PEBS_MIN_DELTA + get_pebs_margin()
+/// Width of the MTF window before a precise-exit target. Covers both the
+/// margin and the `BelowMinDelta` case, where the counter can't arm and MTF
+/// must step the whole remaining distance; a narrower window would let such a
+/// target fire at a run-dependent later exit.
+fn get_mtf_margin(mode: PreciseExitMode) -> u64 {
+    min_arm_delta(mode) + get_pebs_margin(mode)
 }
 
 /// Enable MTF inside the configured single-step range, or (when PEBS is
@@ -141,7 +142,8 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
     let tsc = count + ctx.state().tsc_offset;
     let range = ctx.state().single_step_tsc_range;
     let currently_enabled = ctx.state().mtf_enabled;
-    let pebs_registered = ctx.state().pebs_state.is_some();
+    let pebs_mode = ctx.state().pebs_state.as_deref().map(|p| p.mode);
+    let pebs_registered = pebs_mode.is_some();
 
     let in_single_step = match range {
         Some((start, end)) => tsc >= start && tsc < end,
@@ -150,7 +152,7 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
 
     // Any target's window counts, not just the one PEBS armed for (PEBS has
     // a single counter).
-    let mtf_margin = get_mtf_margin();
+    let mtf_margin = get_mtf_margin(pebs_mode.unwrap_or(PreciseExitMode::Pebs));
     let in_margin = |target_opt: Option<u64>| match target_opt {
         Some(target) => count >= target.saturating_sub(mtf_margin) && count < target,
         None => false,
