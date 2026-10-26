@@ -118,6 +118,12 @@ impl Kernel for LinuxKernel {
     fn local_irq_disable(&self) {
         c_helpers::local_irq_disable();
     }
+
+    fn set_precise_pmi_active(&self, claim_mask: u64) {
+        // SAFETY: Called from the run loop with interrupts disabled, so the
+        // per-CPU mask is set and cleared on the same CPU.
+        unsafe { c_helpers::bedrock_pmi_set_active(claim_mask) }
+    }
 }
 
 /// Real MSR access using RDMSR/WRMSR instructions.

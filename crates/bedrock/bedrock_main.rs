@@ -3,6 +3,7 @@
 //! Bedrock - A Rust-based x86-64 hypervisor Linux kernel module
 
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use core::mem::size_of;
 
@@ -297,6 +298,9 @@ impl MiscDevice for BedrockFile {
     }
 }
 
+/// Whether `bedrock_pmi_nmi_register` succeeded, so drop unregisters it.
+static PMI_NMI_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 /// The bedrock kernel module.
 #[pin_data(PinnedDrop)]
 struct Bedrock {
@@ -333,6 +337,17 @@ impl kernel::InPlaceModule for Bedrock {
                 let miscdev_slot = core::ptr::addr_of_mut!((*slot)._miscdev);
                 register_miscdev_with_mode(c_str!("bedrock"), 0o666).__pinned_init(miscdev_slot)?;
 
+                // Last, so no later init failure can unload the module with
+                // the handler still registered. PDIR works without it, just
+                // less robustly, so a failure is not fatal.
+                // SAFETY: Called once from module init; unregistered in drop.
+                let ret = c_helpers::bedrock_pmi_nmi_register();
+                if ret == 0 {
+                    PMI_NMI_REGISTERED.store(true, Ordering::Release);
+                } else {
+                    log_warn!("Failed to register PMI NMI handler: {}\n", ret);
+                }
+
                 log_info!("Bedrock module loaded\n");
 
                 Ok(())
@@ -345,6 +360,12 @@ impl kernel::InPlaceModule for Bedrock {
 impl PinnedDrop for Bedrock {
     fn drop(self: Pin<&mut Self>) {
         log_info!("Bedrock module unloading...\n");
+
+        if PMI_NMI_REGISTERED.swap(false, Ordering::AcqRel) {
+            // SAFETY: Registered in init; unregister waits for running
+            // handlers (RCU) before the module text goes away.
+            unsafe { c_helpers::bedrock_pmi_nmi_unregister() };
+        }
 
         {
             let mut guard = HANDLER.lock();

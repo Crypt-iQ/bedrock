@@ -123,6 +123,78 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         )
     }
 
+    /// COW one page now so host `write_guest_memory` to it succeeds. No-op for
+    /// GPA 0 or an already-COW'd page.
+    fn pre_cow_page<A: CowAllocator<P>>(&mut self, page_gpa_raw: u64, allocator: &mut A) {
+        if page_gpa_raw == 0 {
+            return;
+        }
+        let page_gpa = GuestPhysAddr::new(page_gpa_raw & !0xFFF);
+
+        if self.cow_pages.contains(page_gpa) {
+            return;
+        }
+
+        let new_page = match allocator.allocate_cow_page() {
+            Ok(page) => page,
+            Err(_) => {
+                log_err!(
+                    "pre_cow_page: failed to allocate page for GPA {:#x}\n",
+                    page_gpa.as_u64()
+                );
+                return;
+            }
+        };
+        let new_page_virt = new_page.virtual_address().as_u64() as *mut u8;
+        let new_page_phys = new_page.physical_address();
+
+        let parent_page = match self.parent_read_page(page_gpa) {
+            Some(ptr) => ptr,
+            None => {
+                log_err!(
+                    "pre_cow_page: GPA {:#x} out of parent memory range\n",
+                    page_gpa.as_u64()
+                );
+                return;
+            }
+        };
+        // SAFETY: parent_page points to a valid PAGE_SIZE parent page;
+        // new_page_virt points to a freshly-allocated PAGE_SIZE page. The
+        // regions do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(parent_page, new_page_virt, PAGE_SIZE);
+        }
+
+        if self.cow_pages.insert(page_gpa, new_page).is_err() {
+            log_err!("pre_cow_page: failed to insert page into COW map\n");
+            return;
+        }
+
+        if let Err(_e) = self.state.ept.remap_4k(
+            allocator,
+            page_gpa,
+            new_page_phys,
+            EptPermissions::READ_WRITE_EXECUTE,
+            EptMemoryType::WriteBack,
+        ) {
+            log_err!(
+                "pre_cow_page: failed to remap EPT for GPA {:#x}\n",
+                page_gpa.as_u64()
+            );
+            return;
+        }
+
+        // SDM Vol 3C §30.4.3.4: single-context INVEPT after changing a leaf's
+        // HPA. See the matching comment in handle_cow_fault.
+        let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
+
+        log_debug!(
+            "pre_cow_page: pre-COW'd page at GPA {:#x} -> HPA {:#x}\n",
+            page_gpa.as_u64(),
+            new_page_phys.as_u64()
+        );
+    }
+
     /// Internal constructor shared by `new` and `new_with_incremented_parent`.
     #[inline(never)]
     fn new_internal<
@@ -172,6 +244,16 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         // Pre-COW the I/O channel page: HYPERCALL_IO_GET_REQUEST writes it via
         // write_guest_memory, which fails on not-yet-COW'd pages.
         forked_vm.pre_cow_io_channel_page(allocator);
+
+        // Pre-COW the PDIR DS page: `pdir_pre_vm_entry` rewinds `pebs_index`
+        // through write_guest_memory, and PDIR's records must land rather than
+        // fault on an R+X page.
+        if let Some(pebs) = forked_vm.state.pebs_state.as_deref() {
+            if pebs.mode == PreciseExitMode::Pdir {
+                let gpa = pebs.ds_management_gpa;
+                forked_vm.pre_cow_page(gpa, allocator);
+            }
+        }
 
         Ok(forked_vm)
     }
@@ -485,74 +567,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
     }
 
     fn pre_cow_io_channel_page<A: CowAllocator<Self::CowPage>>(&mut self, allocator: &mut A) {
-        let page_gpa_raw = self.state.io_channel.page_gpa;
-        if page_gpa_raw == 0 {
-            return;
-        }
-        let page_gpa = GuestPhysAddr::new(page_gpa_raw & !0xFFF);
-
-        if self.cow_pages.contains(page_gpa) {
-            return;
-        }
-
-        let new_page = match allocator.allocate_cow_page() {
-            Ok(page) => page,
-            Err(_) => {
-                log_err!(
-                    "pre_cow_io_channel_page: failed to allocate page for GPA {:#x}\n",
-                    page_gpa.as_u64()
-                );
-                return;
-            }
-        };
-        let new_page_virt = new_page.virtual_address().as_u64() as *mut u8;
-        let new_page_phys = new_page.physical_address();
-
-        let parent_page = match self.parent_read_page(page_gpa) {
-            Some(ptr) => ptr,
-            None => {
-                log_err!(
-                    "pre_cow_io_channel_page: GPA {:#x} out of parent memory range\n",
-                    page_gpa.as_u64()
-                );
-                return;
-            }
-        };
-        // SAFETY: parent_page points to a valid PAGE_SIZE parent page;
-        // new_page_virt points to a freshly-allocated PAGE_SIZE page. The
-        // regions do not overlap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(parent_page, new_page_virt, PAGE_SIZE);
-        }
-
-        if self.cow_pages.insert(page_gpa, new_page).is_err() {
-            log_err!("pre_cow_io_channel_page: failed to insert page into COW map\n");
-            return;
-        }
-
-        if let Err(_e) = self.state.ept.remap_4k(
-            allocator,
-            page_gpa,
-            new_page_phys,
-            EptPermissions::READ_WRITE_EXECUTE,
-            EptMemoryType::WriteBack,
-        ) {
-            log_err!(
-                "pre_cow_io_channel_page: failed to remap EPT for GPA {:#x}\n",
-                page_gpa.as_u64()
-            );
-            return;
-        }
-
-        // SDM Vol 3C §30.4.3.4: single-context INVEPT after changing a leaf's
-        // HPA. See the matching comment in handle_cow_fault.
-        let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
-
-        log_debug!(
-            "pre_cow_io_channel_page: pre-COW'd I/O channel page at GPA {:#x} -> HPA {:#x}\n",
-            page_gpa.as_u64(),
-            new_page_phys.as_u64()
-        );
+        self.pre_cow_page(self.state.io_channel.page_gpa, allocator);
     }
 
     fn finalize_exit_record<K: Kernel>(&mut self, _kernel: &K) {

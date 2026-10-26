@@ -847,6 +847,9 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// Host supports `IA32_DEBUGCTL.FREEZE_WHILE_SMM` (`IA32_PERF_CAPABILITIES`
     /// bit 12), so the guest `DEBUGCTL` can freeze the counters across SMIs.
     pub freeze_perfmon_in_smm: bool,
+    /// Host gets `PreciseExitMode::Pdir` (Skylake/Kaby Lake client). See
+    /// `exits::pebs::host_supports_pdir_precise_exit`.
+    pub pdir_supported: bool,
     /// Hypervisor↔guest I/O channel. See `IoChannelState`.
     pub io_channel: IoChannelState,
     /// Paravirtual batch console. See `SerialConsoleState`.
@@ -980,6 +983,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .read_msr(msr::IA32_PERF_CAPABILITIES)
             .map(|v| (v >> 14) & 1 != 0 && ((v >> 8) & 0xF) >= 4)
             .unwrap_or(false);
+        let pdir_supported = host_supports_pdir_precise_exit(machine.msr_access());
 
         // Check if this machine supports the FREEZE_WHILE_SMM bit.
         let freeze_perfmon_in_smm = machine
@@ -1056,6 +1060,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported,
             freeze_perfmon_in_smm,
+            pdir_supported,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -1830,6 +1835,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported: false,
             freeze_perfmon_in_smm: false,
+            pdir_supported: false,
             io_channel: IoChannelState::new(),
             serial_console: SerialConsoleState::new(),
             last_cpu: None,
@@ -2049,6 +2055,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 .map(|p| heap_box(p.clone_for_fork())),
             pebs_supported: parent_state.pebs_supported,
             freeze_perfmon_in_smm: parent_state.freeze_perfmon_in_smm,
+            pdir_supported: parent_state.pdir_supported,
             io_channel: IoChannelState::clone_for_fork(&parent_state.io_channel),
             serial_console: SerialConsoleState::clone_for_fork(&parent_state.serial_console),
             last_cpu: None,
