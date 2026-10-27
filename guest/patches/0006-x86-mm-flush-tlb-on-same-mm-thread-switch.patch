@@ -1,0 +1,43 @@
+From: Bedrock <bedrock@example.com>
+Subject: [PATCH] x86/mm: Flush TLB when switching between threads of one mm
+
+For deterministic execution under bedrock. A thread can be preempted between
+changing PTEs and the TLB flush that follows (seen: fork in copy_page_range()
+write-protecting pages, flush only at the end of dup_mmap()). A sibling thread
+scheduled in that window, on the same CPU and with no CR3 load, then either
+still has the old translation in the hardware TLB or does not, and takes a
+page fault or not accordingly. Flush on every same-mm switch so the result no
+longer depends on TLB contents.
+
+Signed-off-by: Bedrock <bedrock@example.com>
+---
+ arch/x86/mm/tlb.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 5d221709353e..3d7175be5838 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -858,6 +858,19 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
+ 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
+ 			cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
++		/*
++		 * Deterministic execution (bedrock): another thread of this mm
++		 * may have been preempted in the middle of a page-table change
++		 * whose TLB flush is still to come (fork write-protecting the
++		 * parent's pages in copy_page_range(), an mmu_gather batch, ...).
++		 * Until that flush, whether this thread still gets the old
++		 * translation depends on what the hardware TLB happens to hold,
++		 * which causes a divergence. Start every thread from an
++		 * empty TLB instead, as a switch between two mms already does.
++		 */
++		if (prev != &init_mm)
++			flush_tlb_local();
++
+ 		/* Check if the current mm is transitioning to a global ASID */
+ 		if (mm_needs_global_asid(next, prev_asid)) {
+ 			next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+-- 
+2.47.3
+
