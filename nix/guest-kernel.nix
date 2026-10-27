@@ -25,6 +25,7 @@ let
       # (RAX=11) so guest userspace randomness is fuzzer-controlled and recorded.
       ../guest/patches/0004-random-source-urandom-getrandom-from-vmcall.patch
       ../guest/patches/0005-x86-mm-flush-tlb-clear-accessed.patch
+      ../guest/patches/0006-x86-mm-flush-tlb-on-same-mm-thread-switch.patch
     ];
   };
 
