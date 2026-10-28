@@ -1993,7 +1993,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
 
         Ok(Self {
             vmcs,
-            vmx_ctx: VmxContext::new(),
+            vmx_ctx: VmxContext {
+                guest_cr2: parent_state.vmx_ctx.guest_cr2,
+                ..VmxContext::new()
+            },
             gprs: parent_state.gprs, // Copy GPRs from parent
             ept,
             msr_bitmap,
